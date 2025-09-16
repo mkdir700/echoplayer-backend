@@ -1,0 +1,547 @@
+"""
+JIT (Just-In-Time) 转码服务
+基于窗口的按需转码实现
+"""
+
+import asyncio
+import json
+import logging
+import shutil
+from pathlib import Path
+
+from app.models.window import (
+    CacheStats,
+    TranscodeProfile,
+    TranscodeWindow,
+    WindowCache,
+)
+from app.settings import settings
+from app.utils.hash import (
+    calculate_asset_hash,
+    calculate_profile_hash,
+    calculate_window_id,
+    get_cache_path,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class JITTranscoder:
+    """JIT 转码器"""
+
+    _instance = None
+    _initilized = False
+
+    def __new__(cls, *args, **kwargs):  # noqa: ARG004
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, cache_root: str | None = None, max_concurrent: int = 3):
+        if self._initilized:
+            return
+        self.cache_root = Path(cache_root or settings.v1_CACHE_ROOT)
+        self.max_concurrent = max_concurrent
+
+        # 运行中的任务
+        self.running_windows: dict[tuple[str, str, int], TranscodeWindow] = {}
+        self.task_semaphore = asyncio.Semaphore(max_concurrent)
+
+        # 缓存管理
+        self.cache_index: dict[tuple[str, str, int], WindowCache] = {}
+        self.cache_loaded = False
+
+        # 确保缓存目录存在
+        self.cache_root.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"JIT 转码器初始化完成，缓存目录: {self.cache_root}")
+
+        self._initilized = True
+
+    async def ensure_window(
+        self,
+        input_file: str | Path,
+        time_seconds: float,
+        profile: TranscodeProfile | None = None,
+    ) -> str:
+        """
+        确保指定时间点的窗口可用
+
+        Args:
+            input_file: 输入文件路径
+            time_seconds: 目标时间点（秒）
+            profile: 转码配置
+
+        Returns:
+            str: m3u8 播放列表 URL
+        """
+        input_path = Path(input_file)
+        if not input_path.exists():
+            raise FileNotFoundError(f"输入文件不存在: {input_path}")
+
+        # 使用默认配置
+        if profile is None:
+            profile = TranscodeProfile()
+
+        # 计算哈希值
+        asset_hash = calculate_asset_hash(input_path)
+        profile_hash = calculate_profile_hash(profile.__dict__, profile.version)
+        window_id = calculate_window_id(time_seconds, profile.window_duration)
+
+        # 检查缓存
+        cache_key = (asset_hash, profile_hash, window_id)
+        if await self._check_cache_hit(cache_key):
+            cache_path = get_cache_path(
+                self.cache_root, asset_hash, profile_hash, window_id
+            )
+            playlist_path = cache_path / "index.m3u8"
+            logger.info(f"窗口 {window_id} 缓存命中: {playlist_path}")
+            return f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8"
+
+        # 检查是否正在转码
+        if cache_key in self.running_windows:
+            window = self.running_windows[cache_key]
+            logger.info(f"窗口 {window_id} 正在转码中，等待完成...")
+
+            # 等待转码完成
+            if window.future:
+                try:
+                    await window.future
+                except Exception as e:
+                    logger.error(f"等待窗口 {window_id} 转码失败: {e}")
+                    raise
+
+            if window.is_completed:
+                return f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8"
+            raise RuntimeError(f"窗口 {window_id} 转码失败: {window.error_message}")
+
+        # 启动新的转码任务
+        return await self._start_transcoding(
+            input_path, asset_hash, profile_hash, window_id, profile
+        )
+
+    async def _check_cache_hit(self, cache_key: tuple[str, str, int]) -> bool:
+        """检查缓存命中"""
+        await self._ensure_cache_loaded()
+
+        if cache_key not in self.cache_index:
+            return False
+
+        cache = self.cache_index[cache_key]
+        if not cache.is_valid():
+            # 缓存无效，移除
+            del self.cache_index[cache_key]
+            return False
+
+        # 更新访问信息
+        cache.update_access()
+        await self._save_cache_metadata(cache)
+        return True
+
+    async def _start_transcoding(
+        self,
+        input_file: Path,
+        asset_hash: str,
+        profile_hash: str,
+        window_id: int,
+        profile: TranscodeProfile,
+    ) -> str:
+        """启动转码任务"""
+        # 计算窗口时间范围
+        start_time = window_id * profile.window_duration
+        duration = profile.window_duration
+
+        # 创建输出目录
+        output_dir = get_cache_path(
+            self.cache_root, asset_hash, profile_hash, window_id
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建转码窗口
+        window = TranscodeWindow(
+            window_id=window_id,
+            asset_hash=asset_hash,
+            profile_hash=profile_hash,
+            input_file=input_file,
+            start_time=start_time,
+            duration=duration,
+            output_dir=output_dir,
+        )
+
+        cache_key = (asset_hash, profile_hash, window_id)
+        self.running_windows[cache_key] = window
+
+        # 创建转码任务
+        future = asyncio.create_task(self._transcode_window(window, profile))
+        window.future = future
+
+        try:
+            # 等待转码完成
+            await future
+
+            if window.is_completed:
+                # 添加到缓存索引
+                cache = WindowCache(
+                    window_id=window_id,
+                    asset_hash=asset_hash,
+                    profile_hash=profile_hash,
+                    cache_dir=output_dir,
+                    playlist_path=window.playlist_path,
+                )
+                cache.file_size_bytes = await self._calculate_dir_size(output_dir)
+                self.cache_index[cache_key] = cache
+                await self._save_cache_metadata(cache)
+
+                return f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8"
+            raise RuntimeError(f"窗口 {window_id} 转码失败: {window.error_message}")
+
+        finally:
+            # 清理运行状态
+            if cache_key in self.running_windows:
+                del self.running_windows[cache_key]
+
+    async def _transcode_window(
+        self, window: TranscodeWindow, profile: TranscodeProfile
+    ) -> None:
+        """执行窗口转码"""
+        async with self.task_semaphore:  # 控制并发数
+            try:
+                await self._execute_ffmpeg(window, profile)
+            except Exception as e:
+                window.fail_transcoding(str(e))
+                raise
+
+    async def _execute_ffmpeg(
+        self, window: TranscodeWindow, profile: TranscodeProfile
+    ) -> None:
+        """执行 FFmpeg 转码"""
+        window.start_transcoding()
+
+        # 构建 FFmpeg 命令
+        cmd_args = self._build_ffmpeg_command(window, profile)
+        logger.info(f"执行 FFmpeg 命令: {' '.join(cmd_args)}")
+        logger.debug(f"命令参数详情: {cmd_args}")
+
+        try:
+            # 启动 FFmpeg 进程
+            process = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            window.process = process
+
+            # 等待进程完成
+            stdout, stderr = await process.communicate()
+
+            logger.debug(f"FFmpeg 返回代码: {process.returncode}")
+            if stderr:
+                logger.debug(
+                    f"FFmpeg stderr: {stderr.decode()[:1000]}"
+                )  # 只记录前1000字符
+
+            if process.returncode == 0:
+                # 验证输出文件
+                if window.playlist_path.exists():
+                    window.complete_transcoding()
+                    logger.info(f"窗口 {window.window_id} 转码成功")
+                else:
+                    raise RuntimeError("m3u8 文件未生成")
+            else:
+                error_msg = (
+                    stderr.decode()
+                    if stderr
+                    else f"FFmpeg 返回代码: {process.returncode}"
+                )
+                raise RuntimeError(error_msg)
+
+        except asyncio.CancelledError:
+            # 任务被取消
+            if window.process:
+                window.process.kill()
+            raise
+        except Exception as e:
+            logger.error(f"FFmpeg 执行失败: {e}")
+            raise
+
+    def _build_ffmpeg_command(
+        self, window: TranscodeWindow, profile: TranscodeProfile
+    ) -> list[str]:
+        """构建 FFmpeg 命令行
+
+        基于最佳实践重构，参考命令格式：
+        ffmpeg -hide_banner -y -ss 0 -t 30 -i "/path/to/input.mkv" \
+        -map 0:v:0 -map 0:a:0 \
+        -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+        -g 48 -keyint_min 48 -sc_threshold 0 \
+        -c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k \
+        -fflags +genpts -avoid_negative_ts make_zero \
+        -af "aresample=async=1:first_pts=0" \
+        -f hls -hls_time 4 -hls_list_size 0 \
+        -hls_segment_type fmp4 \
+        -hls_fmp4_init_filename "init.mp4" \
+        -hls_segment_filename "seg_%05d.m4s" \
+        "index.m3u8"
+        """
+        input_file = str(window.input_file)
+        output_dir = str(window.output_dir)
+
+        return [
+            settings.FFMPEG_EXECUTABLE,
+            "-hide_banner",  # 隐藏版本信息横幅
+            "-y",  # 覆盖输出文件
+            "-ss",
+            str(window.start_time),  # 开始时间
+            "-t",
+            str(window.duration),  # 持续时间
+            "-i",
+            input_file,  # 输入文件
+            # 流映射 - 显式选择视频和音频流
+            "-map",
+            "0:v:0",  # 第一个视频流
+            "-map",
+            "0:a:0",  # 第一个音频流
+            # 视频编码设置
+            "-c:v",
+            profile.video_codec,
+            "-preset",
+            profile.video_preset,
+            "-pix_fmt",
+            profile.pixel_format,
+            "-g",
+            str(profile.gop_size),
+            "-keyint_min",
+            str(profile.keyint_min),
+            "-sc_threshold",
+            "0",  # 禁用场景变化检测
+            # 音频编码设置
+            "-c:a",
+            profile.audio_codec,
+            "-profile:a",
+            "aac_low",  # AAC低复杂度配置
+            "-ar",
+            "48000",  # 采样率
+            "-ac",
+            "2",  # 双声道
+            "-b:a",
+            profile.audio_bitrate,
+            # 时间戳处理
+            "-fflags",
+            "+genpts",  # 生成展示时间戳
+            "-avoid_negative_ts",
+            "make_zero",  # 避免负时间戳
+            "-af",
+            "aresample=async=1:first_pts=0",  # 音频重采样滤镜
+            # HLS 输出设置
+            "-f",
+            "hls",
+            "-hls_time",
+            str(profile.hls_time),
+            "-hls_list_size",
+            str(profile.hls_list_size),
+            "-hls_segment_type",
+            "fmp4",  # 使用 fMP4 分段格式
+            "-hls_fmp4_init_filename",
+            "init.mp4",  # 初始化文件名
+            "-hls_segment_filename",
+            f"{output_dir}/seg_%05d.m4s",  # 分段文件名
+            # 输出播放列表
+            f"{output_dir}/index.m3u8",
+        ]
+
+    async def _ensure_cache_loaded(self) -> None:
+        """确保缓存索引已加载"""
+        if self.cache_loaded:
+            return
+
+        logger.info("加载缓存索引...")
+        count = 0
+
+        # 扫描缓存目录
+        for asset_dir in self.cache_root.iterdir():
+            if not asset_dir.is_dir():
+                continue
+
+            for profile_dir in asset_dir.iterdir():
+                if not profile_dir.is_dir():
+                    continue
+
+                for window_dir in profile_dir.iterdir():
+                    if not window_dir.is_dir():
+                        continue
+
+                    playlist_path = window_dir / "index.m3u8"
+                    if not playlist_path.exists():
+                        continue
+
+                    # 解析目录结构
+                    try:
+                        asset_hash = asset_dir.name
+                        profile_hash = profile_dir.name
+                        window_id = int(window_dir.name.replace("win_", ""))
+
+                        # 加载元数据
+                        cache = await self._load_cache_metadata(
+                            window_id,
+                            asset_hash,
+                            profile_hash,
+                            window_dir,
+                            playlist_path,
+                        )
+
+                        cache_key = (asset_hash, profile_hash, window_id)
+                        self.cache_index[cache_key] = cache
+                        count += 1
+
+                    except Exception as e:
+                        logger.warning(f"加载缓存失败 {window_dir}: {e}")
+
+        self.cache_loaded = True
+        logger.info(f"缓存索引加载完成，共 {count} 个窗口")
+
+    async def _load_cache_metadata(
+        self,
+        window_id: int,
+        asset_hash: str,
+        profile_hash: str,
+        cache_dir: Path,
+        playlist_path: Path,
+    ) -> WindowCache:
+        """加载缓存元数据"""
+        meta_file = cache_dir / "index.meta.json"
+
+        # 默认值
+        cache = WindowCache(
+            window_id=window_id,
+            asset_hash=asset_hash,
+            profile_hash=profile_hash,
+            cache_dir=cache_dir,
+            playlist_path=playlist_path,
+        )
+
+        # 尝试从 meta 文件加载
+        if meta_file.exists():
+            try:
+                with meta_file.open() as f:
+                    meta = json.load(f)
+                    cache.hit_count = meta.get("hit_count", 0)
+                    cache.last_access = meta.get("last_access_ts", cache.created_at)
+                    cache.file_size_bytes = meta.get("bytes_total", 0)
+            except Exception as e:
+                logger.warning(f"读取元数据失败 {meta_file}: {e}")
+
+        # 计算文件大小（如果未设置）
+        if cache.file_size_bytes == 0:
+            cache.file_size_bytes = await self._calculate_dir_size(cache_dir)
+
+        return cache
+
+    async def _save_cache_metadata(self, cache: WindowCache) -> None:
+        """保存缓存元数据"""
+        meta_file = cache.cache_dir / "index.meta.json"
+
+        try:
+            meta = {
+                "hit_count": cache.hit_count,
+                "last_access_ts": cache.last_access,
+                "bytes_total": cache.file_size_bytes,
+                "created_at": cache.created_at,
+            }
+
+            with meta_file.open("w") as f:
+                json.dump(meta, f, indent=2)
+
+        except Exception as e:
+            logger.warning(f"保存元数据失败 {meta_file}: {e}")
+
+    async def _calculate_dir_size(self, directory: Path) -> int:
+        """计算目录大小"""
+        total_size = 0
+        try:
+            for file_path in directory.rglob("*"):
+                if file_path.is_file():
+                    total_size += file_path.stat().st_size
+        except Exception as e:
+            logger.warning(f"计算目录大小失败 {directory}: {e}")
+        return total_size
+
+    async def get_cache_stats(self) -> CacheStats:
+        """获取缓存统计信息"""
+        await self._ensure_cache_loaded()
+
+        if not self.cache_index:
+            return CacheStats()
+
+        caches = list(self.cache_index.values())
+        total_windows = len(caches)
+        total_size = sum(c.file_size_bytes for c in caches)
+        total_hits = sum(c.hit_count for c in caches)
+        avg_size = total_size / total_windows if total_windows > 0 else 0
+
+        # 计算最老窗口年龄
+        oldest_age = 0.0
+        if caches:
+            oldest_age = max(c.get_age_seconds() for c in caches)
+
+        return CacheStats(
+            total_windows=total_windows,
+            total_size_bytes=total_size,
+            total_hit_count=total_hits,
+            avg_window_size=avg_size,
+            oldest_window_age=oldest_age,
+        )
+
+    async def cleanup_expired_caches(self, max_age_hours: int = 24) -> int:
+        """清理过期缓存"""
+        await self._ensure_cache_loaded()
+
+        max_age_seconds = max_age_hours * 3600
+        removed_count = 0
+
+        # 找出过期的缓存
+        expired_keys = []
+        for cache_key, cache in self.cache_index.items():
+            if cache.get_age_seconds() > max_age_seconds:
+                expired_keys.append(cache_key)
+
+        # 删除过期缓存
+        for cache_key in expired_keys:
+            cache = self.cache_index[cache_key]
+            try:
+                if cache.cache_dir.exists():
+                    shutil.rmtree(cache.cache_dir)
+                del self.cache_index[cache_key]
+                removed_count += 1
+                logger.info(f"删除过期缓存: {cache.cache_dir}")
+            except Exception as e:
+                logger.error(f"删除缓存失败 {cache.cache_dir}: {e}")
+
+        if removed_count > 0:
+            logger.info(f"清理完成，删除 {removed_count} 个过期缓存")
+
+        return removed_count
+
+    def get_window_url(
+        self, asset_hash: str, profile_hash: str, window_id: int, file_name: str
+    ) -> Path | None:
+        """获取窗口文件路径"""
+        cache_path = get_cache_path(
+            self.cache_root, asset_hash, profile_hash, window_id
+        )
+        file_path = cache_path / file_name
+
+        if file_path.exists():
+            return file_path
+
+        return None
+
+    def shutdown(self) -> None:
+        """关闭转码器"""
+        logger.info("JIT 转码器正在关闭...")
+
+        # 取消所有运行中的任务
+        for window in self.running_windows.values():
+            window.cleanup()
+
+        self.running_windows.clear()
+        logger.info("JIT 转码器已关闭")
