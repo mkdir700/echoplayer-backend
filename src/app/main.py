@@ -14,6 +14,7 @@ from .schemas.common import ErrorResponse
 from .services.cache_manager import CacheManager
 from .services.jit_transcoder import JITTranscoder
 from .services.preload_strategy import PreloadStrategy
+from .services.session_manager import SessionManager
 from .settings import settings
 from .utils.log_config import configure_uvicorn_logging, setup_logging
 
@@ -36,6 +37,7 @@ async def lifespan(app: FastAPI):
 
     jit_transcoder = JITTranscoder()
     cache_manager = CacheManager()
+    session_manager = SessionManager(jit_transcoder)
     preload_strategy = PreloadStrategy(jit_transcoder)
 
     # 启动后台清理任务
@@ -46,6 +48,7 @@ async def lifespan(app: FastAPI):
     # 关闭时清理
     logger.info("🛑 转码服务关闭中...")
 
+    session_manager.shutdown()
     jit_transcoder.shutdown()
     preload_strategy.shutdown()
 
