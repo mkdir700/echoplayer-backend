@@ -69,15 +69,7 @@ class EchoPlayerFormatter(logging.Formatter):
         return formatted
 
 
-class UvicornAccessFormatter(DefaultFormatter):
-    """自定义Uvicorn访问日志格式化器"""
-
-    def __init__(self):
-        super().__init__(
-            fmt='%(asctime)s [%(levelname)s] access: %(client_addr)s - "%(request_line)s" %(status_code)s',
-            datefmt="%Y-%m-%d %H:%M:%S",
-            use_colors=True,
-        )
+# 移除自定义的访问日志格式化器，使用uvicorn默认的
 
 
 def setup_logging(level: str = "INFO", use_colors: bool = True) -> None:
@@ -144,7 +136,9 @@ def get_uvicorn_log_config() -> dict[str, Any]:
                 "use_colors": True,
             },
             "access": {
-                "()": UvicornAccessFormatter,
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": '%(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s',
+                "use_colors": True,
             },
         },
         "handlers": {

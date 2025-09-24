@@ -1,0 +1,292 @@
+"""
+会话级播放列表生成器
+负责生成跨窗口连续播放的HLS播放列表
+"""
+
+import logging
+
+import aiofiles
+
+from app.models.session import (
+    PlaybackSession,
+    PlaylistSegment,
+    SessionPlaylist,
+    WindowReference,
+)
+from app.services.jit_transcoder import JITTranscoder
+from app.utils.hash import get_cache_path
+
+logger = logging.getLogger(__name__)
+
+
+class SessionPlaylistGenerator:
+    """会话级播放列表生成器"""
+
+    def __init__(self, jit_transcoder: JITTranscoder):
+        self.jit_transcoder = jit_transcoder
+
+    async def generate_playlist(self, session: PlaybackSession) -> SessionPlaylist:
+        """
+        为会话生成播放列表
+
+        Args:
+            session: 播放会话
+
+        Returns:
+            SessionPlaylist: 生成的播放列表
+        """
+        if not session.needs_playlist_rebuild() and session.playlist is not None:
+            return session.playlist
+
+        logger.debug(f"为会话 {session.session_id} 生成播放列表")
+
+        # 创建新的播放列表
+        playlist = SessionPlaylist(
+            session_id=session.session_id,
+            target_duration=session.profile.hls_time,
+            version=6,
+            is_live=False,
+        )
+
+        # 获取排序后的窗口
+        sorted_windows = self._get_sorted_windows(session)
+        if not sorted_windows:
+            logger.warning(f"会话 {session.session_id} 没有可用的窗口")
+            return playlist
+
+        # 生成播放列表片段
+        segments = await self._generate_segments(sorted_windows)
+        playlist.segments = segments
+
+        # 更新会话播放列表
+        session.playlist = playlist
+        session.mark_playlist_clean()
+
+        logger.info(
+            f"会话 {session.session_id} 播放列表生成完成: "
+            f"{len(segments)} 个片段, {playlist.get_window_count()} 个窗口"
+        )
+
+        return playlist
+
+    def _get_sorted_windows(self, session: PlaybackSession) -> list[WindowReference]:
+        """获取排序后的窗口列表"""
+        # 只选择已准备好的窗口
+        ready_windows = [
+            window
+            for window in session.windows.values()
+            if window.ready and window.window_id in session.loaded_windows
+        ]
+
+        # 按窗口ID排序
+        return sorted(ready_windows, key=lambda w: w.window_id)
+
+    async def _generate_segments(
+        self, windows: list[WindowReference]
+    ) -> list[PlaylistSegment]:
+        """生成播放列表片段"""
+        segments: list[PlaylistSegment] = []
+        sequence_number = 0
+
+        for i, window in enumerate(windows):
+            # 加载窗口的片段信息
+            window_segments = await self._load_window_segments(window)
+            if not window_segments:
+                logger.warning(f"窗口 {window.window_id} 没有可用的片段")
+                continue
+
+            # 检查是否需要不连续标记
+            needs_discontinuity = self._needs_discontinuity_marker(i, windows)
+
+            # 添加窗口片段到播放列表
+            for j, (segment_url, duration) in enumerate(window_segments):
+                segment = PlaylistSegment(
+                    url=segment_url,
+                    duration=duration,
+                    sequence_number=sequence_number,
+                    window_id=window.window_id,
+                    discontinuity_before=(j == 0 and needs_discontinuity),
+                )
+                segments.append(segment)
+                sequence_number += 1
+
+        return segments
+
+    async def _load_window_segments(
+        self, window: WindowReference
+    ) -> list[tuple[str, float]]:
+        """加载窗口的片段信息"""
+        try:
+            # 获取窗口缓存路径
+            cache_path = get_cache_path(
+                self.jit_transcoder.cache_root,
+                window.asset_hash,
+                window.profile_hash,
+                window.window_id,
+            )
+
+            # 读取窗口的m3u8文件
+            playlist_path = cache_path / "index.m3u8"
+            if not playlist_path.exists():
+                logger.error(
+                    f"窗口 {window.window_id} 的播放列表文件不存在: {playlist_path}"
+                )
+                return []
+
+            segments = []
+            async with aiofiles.open(playlist_path, encoding="utf-8") as f:
+                content = await f.read()
+                lines = [line.strip() for line in content.splitlines()]
+
+            # 解析m3u8文件
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+
+                # 查找EXTINF行
+                if line.startswith("#EXTINF:"):
+                    try:
+                        # 解析时长
+                        duration_str = line.split(":")[1].split(",")[0]
+                        duration = float(duration_str)
+
+                        # 验证时长有效性，避免0.0或负值
+                        if duration <= 0.0:
+                            # 使用窗口的默认分段时长作为回退
+                            duration = window.duration / 10  # 假设窗口有10个分段
+                            if duration <= 0.0:
+                                duration = 4.0  # 最后的回退值
+                            logger.warning(
+                                f"窗口 {window.window_id} 片段时长无效 ({duration_str})，"
+                                f"使用回退值: {duration:.1f}s"
+                            )
+
+                        # 下一行应该是片段文件名
+                        if i + 1 < len(lines):
+                            segment_file = lines[i + 1].strip()
+                            if segment_file and not segment_file.startswith("#"):
+                                # 构建完整的片段URL
+                                segment_url = f"/api/v1/jit/hls/{window.asset_hash}/{window.profile_hash}/{window.window_id:06d}/{segment_file}"
+                                segments.append((segment_url, duration))
+                                i += 2  # 跳过片段文件行
+                                continue
+                    except (IndexError, ValueError) as e:
+                        logger.warning(f"解析片段信息失败: {line}, 错误: {e}")
+
+                i += 1
+
+            logger.debug(f"窗口 {window.window_id} 加载了 {len(segments)} 个片段")
+            return segments
+
+        except Exception as e:
+            logger.error(f"加载窗口 {window.window_id} 片段失败: {e}")
+            return []
+
+    def _needs_discontinuity_marker(
+        self, window_index: int, windows: list[WindowReference]
+    ) -> bool:
+        """检查是否需要不连续标记"""
+        # 第一个窗口不需要不连续标记
+        if window_index == 0:
+            return False
+
+        current_window = windows[window_index]
+        previous_window = windows[window_index - 1]
+
+        # 对于JIT转码，不同窗口间通常需要不连续标记
+        # 因为每个窗口是独立转码进程的产出，PTS/时间基可能不连续
+        if current_window.window_id != previous_window.window_id:
+            logger.debug(f"窗口 {current_window.window_id} 需要不连续标记 (窗口边界)")
+            return True
+
+        # 检查时间是否连续
+        time_gap = abs(current_window.start_time - previous_window.end_time)
+
+        # 如果时间间隙超过0.1秒，认为需要不连续标记
+        if time_gap > 0.1:
+            logger.debug(
+                f"窗口 {current_window.window_id} 需要不连续标记 "
+                f"(时间间隙: {time_gap:.2f}s)"
+            )
+            return True
+
+        # 检查编码参数是否一致
+        if (
+            current_window.asset_hash != previous_window.asset_hash
+            or current_window.profile_hash != previous_window.profile_hash
+        ):
+            logger.debug(
+                f"窗口 {current_window.window_id} 需要不连续标记 (编码参数不同)"
+            )
+            return True
+
+        return False
+
+    async def update_playlist_for_seek(
+        self, session: PlaybackSession, seek_time: float
+    ) -> SessionPlaylist | None:
+        """
+        为seek操作更新播放列表
+
+        Args:
+            session: 播放会话
+            seek_time: 目标时间
+
+        Returns:
+            更新后的播放列表，如果无需更新则返回None
+        """
+        # 更新会话的当前时间
+        old_current_time = session.current_time
+        session.current_time = seek_time
+
+        # 检查是否跨窗口
+        old_window = int(old_current_time // session.profile.window_duration)
+        new_window = int(seek_time // session.profile.window_duration)
+
+        if old_window != new_window:
+            logger.info(
+                f"会话 {session.session_id} seek跨窗口: {old_window} -> {new_window}"
+            )
+
+            # 标记需要重建播放列表
+            session.playlist_dirty = True
+
+            # 清理不再需要的旧窗口
+            cleaned_windows = session.cleanup_old_windows()
+            if cleaned_windows:
+                logger.debug(
+                    f"清理了 {len(cleaned_windows)} 个旧窗口: {cleaned_windows}"
+                )
+
+            # 重新生成播放列表
+            return await self.generate_playlist(session)
+
+        return None
+
+    def get_playlist_url(self, session_id: str) -> str:
+        """获取会话播放列表URL"""
+        return f"/api/v1/session/{session_id}/playlist.m3u8"
+
+    async def validate_playlist(self, playlist: SessionPlaylist) -> bool:
+        """验证播放列表的有效性"""
+        if not playlist.segments:
+            return False
+
+        # 检查片段连续性
+        for i in range(1, len(playlist.segments)):
+            current_segment = playlist.segments[i]
+            previous_segment = playlist.segments[i - 1]
+
+            # 如果不是同一个窗口，应该有不连续标记或者窗口是相邻的
+            if (
+                current_segment.window_id != previous_segment.window_id
+                and not current_segment.discontinuity_before
+                and abs(current_segment.window_id - previous_segment.window_id) > 1
+            ):
+                logger.warning(
+                    f"播放列表片段不连续: "
+                    f"片段 {previous_segment.sequence_number} -> {current_segment.sequence_number}"
+                )
+                return False
+
+        return True

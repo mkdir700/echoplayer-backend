@@ -132,6 +132,9 @@ async def serve_hls_file(
             media_type = "application/vnd.apple.mpegurl"
         elif file_name.endswith(".ts"):
             media_type = "video/mp2t"
+        elif file_name.endswith((".m4s", ".mp4")):
+            # fMP4 分段和初始化文件
+            media_type = "video/mp4"
         else:
             media_type = "application/octet-stream"
 
