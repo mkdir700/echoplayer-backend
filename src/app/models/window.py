@@ -92,6 +92,12 @@ class WindowCache:
     hit_count: int = 0  # 命中次数
     file_size_bytes: int = 0  # 文件总大小
 
+    # 转码信息（用于后台转码）
+    input_file_path: str | None = None  # 原始文件路径
+    start_time: float | None = None  # 窗口开始时间
+    duration: float | None = None  # 窗口持续时间
+    profile_config: dict | None = None  # 转码配置
+
     def update_access(self) -> None:
         """更新访问时间"""
         self.last_access = time.time()

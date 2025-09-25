@@ -121,7 +121,38 @@ async def serve_hls_file(
     )
 
     if not file_path or not file_path.exists():
-        return Response(status_code=503, headers={"Retry-After": "10"})
+        # 尝试从元数据获取转码信息并启动后台转码
+        try:
+            (
+                input_file,
+                _,
+                duration,
+                profile,
+            ) = await jit_transcoder.get_transcoding_info(
+                asset_hash, profile_hash, 0
+            )  # 从第一个窗口中获取，转码原数据
+
+            if input_file and profile:
+                # 根据 window_id 重新计算正确的 start_time
+                correct_start_time = int(window_id) * profile.window_duration
+                # 启动后台转码任务
+                success = await jit_transcoder.start_background_transcoding(
+                    input_file, correct_start_time, duration, profile
+                )
+                if success:
+                    logger.info(
+                        f"已为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码"
+                    )
+                else:
+                    logger.warning(
+                        f"为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码失败"
+                    )
+            else:
+                logger.warning(f"{input_file}")
+        except Exception as e:
+            logger.warning(f"尝试启动后台转码时出错: {e}")
+
+        return Response(status_code=503, headers={"Retry-After": "3"})
 
     # 确定媒体类型
     if file_name.endswith(".m3u8"):
