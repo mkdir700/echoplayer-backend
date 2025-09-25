@@ -325,13 +325,8 @@ class JITTranscoder:
             "2",  # 双声道
             "-b:a",
             profile.audio_bitrate,
-            # 时间戳处理
-            "-fflags",
-            "+genpts",  # 生成展示时间戳
-            "-avoid_negative_ts",
-            "make_zero",  # 避免负时间戳
-            "-af",
-            "aresample=async=1:first_pts=0",  # 音频重采样滤镜
+            "-output_ts_offset",
+            str(window.start_time),
             # HLS 输出设置
             "-f",
             "hls",
