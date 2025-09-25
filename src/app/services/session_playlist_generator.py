@@ -10,6 +10,7 @@ import aiofiles
 from app.models.session import (
     PlaybackSession,
     PlaylistSegment,
+    PrecomputedSegment,
     SessionPlaylist,
     WindowReference,
 )
@@ -54,8 +55,8 @@ class SessionPlaylistGenerator:
             logger.warning(f"会话 {session.session_id} 没有可用的窗口")
             return playlist
 
-        # 生成播放列表片段
-        segments = await self._generate_segments(sorted_windows)
+        # 生成播放列表片段（基于预计算）
+        segments = await self._generate_precomputed_segments(session)
         playlist.segments = segments
 
         # 更新会话播放列表
@@ -81,10 +82,107 @@ class SessionPlaylistGenerator:
         # 按窗口ID排序
         return sorted(ready_windows, key=lambda w: w.window_id)
 
-    async def _generate_segments(
+    async def _generate_precomputed_segments(
+        self, session: PlaybackSession
+    ) -> list[PlaylistSegment]:
+        """基于预计算生成播放列表片段"""
+        segments: list[PlaylistSegment] = []
+
+        # 如果没有视频时长，无法生成完整播放列表
+        if session.duration is None:
+            logger.warning(
+                f"会话 {session.session_id} 缺少视频时长信息，回退到基于窗口的生成"
+            )
+            sorted_windows = self._get_sorted_windows(session)
+            return await self._generate_segments_from_windows(sorted_windows)
+
+        # 预计算所有分片
+        precomputed_segments = self._precompute_all_segments(session)
+
+        sequence_number = 0
+        prev_window_id = None
+
+        for precomp_segment in precomputed_segments:
+            # 检查是否需要不连续标记（窗口边界）
+            needs_discontinuity = (
+                prev_window_id is not None
+                and precomp_segment.window_id != prev_window_id
+            )
+
+            # 生成完整的分片URL
+            segment_url = f"/api/v1/jit/hls/{session.asset_hash}/{session.profile_hash}/{precomp_segment.window_id:06d}/{precomp_segment.url}"
+
+            # 检查分片是否可用（所属窗口是否已转码）
+            is_available = precomp_segment.window_id in session.loaded_windows
+
+            segment = PlaylistSegment(
+                url=segment_url,
+                duration=precomp_segment.duration,
+                sequence_number=sequence_number,
+                window_id=precomp_segment.window_id,
+                discontinuity_before=needs_discontinuity,
+                available=is_available,
+            )
+
+            segments.append(segment)
+            sequence_number += 1  # noqa: SIM113
+            prev_window_id = precomp_segment.window_id
+
+        logger.info(
+            f"会话 {session.session_id} 预计算生成 {len(segments)} 个片段，"
+            f"可用片段: {sum(1 for s in segments if s.available)}"
+        )
+
+        return segments
+
+    def _precompute_all_segments(
+        self, session: PlaybackSession
+    ) -> list[PrecomputedSegment]:
+        """预计算视频的所有分片结构"""
+        segments = []
+        current_time = 0.0
+        sequence_number = 0
+
+        hls_time = session.profile.hls_time
+        window_duration = session.profile.window_duration
+        total_duration = session.duration
+
+        # 确保total_duration不为None
+        if total_duration is None:
+            raise ValueError(f"会话 {session.session_id} 缺少视频时长信息")
+
+        while current_time < total_duration:
+            # 计算当前分片所属的窗口ID
+            window_id = int(current_time // window_duration)
+
+            # 计算窗口内分片索引
+            window_start_time = window_id * window_duration
+            segment_in_window = int((current_time - window_start_time) / hls_time)
+
+            # 计算分片时长（处理最后一个分片）
+            remaining_time = total_duration - current_time
+            segment_duration = min(hls_time, remaining_time)
+
+            # 创建预计算分片
+            segment = PrecomputedSegment(
+                segment_index=segment_in_window,
+                window_id=window_id,
+                start_time=current_time,
+                duration=segment_duration,
+                sequence_number=sequence_number,
+            )
+
+            segments.append(segment)
+            current_time += segment_duration
+            sequence_number += 1
+
+        logger.debug(f"预计算生成 {len(segments)} 个分片，覆盖 {total_duration:.1f}s")
+        return segments
+
+    async def _generate_segments_from_windows(
         self, windows: list[WindowReference]
     ) -> list[PlaylistSegment]:
-        """生成播放列表片段"""
+        """基于已转码窗口生成播放列表片段（回退方法）"""
         segments: list[PlaylistSegment] = []
         sequence_number = 0
 
@@ -106,6 +204,7 @@ class SessionPlaylistGenerator:
                     sequence_number=sequence_number,
                     window_id=window.window_id,
                     discontinuity_before=(j == 0 and needs_discontinuity),
+                    available=True,  # 从窗口加载的片段都是可用的
                 )
                 segments.append(segment)
                 sequence_number += 1
@@ -262,6 +361,35 @@ class SessionPlaylistGenerator:
             return await self.generate_playlist(session)
 
         return None
+
+    async def update_segment_availability(self, session: PlaybackSession) -> bool:
+        """更新播放列表中分片的可用状态
+
+        Args:
+            session: 播放会话
+
+        Returns:
+            是否有分片状态发生变化
+        """
+        if session.playlist is None or not session.playlist.segments:
+            return False
+
+        changed = False
+        for segment in session.playlist.segments:
+            # 检查分片所属窗口是否已加载
+            new_availability = segment.window_id in session.loaded_windows
+
+            if segment.available != new_availability:
+                segment.available = new_availability
+                changed = True
+
+        if changed:
+            logger.debug(
+                f"会话 {session.session_id} 分片可用性更新完成，"
+                f"可用分片: {sum(1 for s in session.playlist.segments if s.available)}"
+            )
+
+        return changed
 
     def get_playlist_url(self, session_id: str) -> str:
         """获取会话播放列表URL"""

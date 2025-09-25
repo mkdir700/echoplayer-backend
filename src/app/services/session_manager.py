@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 import logging
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.models.session import (
 from app.models.window import TranscodeProfile
 from app.services.jit_transcoder import JITTranscoder
 from app.services.session_playlist_generator import SessionPlaylistGenerator
+from app.settings import settings
 from app.utils.hash import calculate_asset_hash, calculate_profile_hash
 
 logger = logging.getLogger(__name__)
@@ -55,6 +57,46 @@ class SessionManager:
         logger.info("会话管理器初始化完成")
         self._initialized = True
 
+    async def _get_video_duration(self, file_path: Path) -> float | None:
+        """获取视频文件时长
+
+        Args:
+            file_path: 视频文件路径
+
+        Returns:
+            视频时长（秒），如果获取失败返回None
+        """
+        try:
+            cmd = [
+                settings.FFPROBE_EXECUTABLE,
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                str(file_path),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                logger.error(f"ffprobe获取视频时长失败: {stderr.decode()}")
+                return None
+
+            result = json.loads(stdout.decode())
+            duration = float(result["format"]["duration"])
+            logger.debug(f"视频 {file_path} 时长: {duration:.1f}s")
+            return duration
+
+        except Exception as e:
+            logger.error(f"获取视频时长失败: {e}")
+            return None
+
     async def create_session(
         self,
         file_path: Path,
@@ -82,6 +124,9 @@ class SessionManager:
         asset_hash = calculate_asset_hash(file_path)
         profile_hash = calculate_profile_hash(profile.__dict__, profile.version)
 
+        # 获取视频时长
+        duration = await self._get_video_duration(file_path)
+
         # 创建会话
         session = PlaybackSession(
             file_path=file_path,
@@ -89,6 +134,7 @@ class SessionManager:
             profile=profile,
             profile_hash=profile_hash,
             current_time=initial_time,
+            duration=duration,
             expires_at=time.time() + self.session_timeout,
         )
 
@@ -180,6 +226,9 @@ class SessionManager:
         # 确保新位置的窗口可用
         await self._ensure_windows_available(session)
 
+        # 更新分片可用性
+        await self.playlist_generator.update_segment_availability(session)
+
         return session
 
     async def get_session_playlist(self, session_id: str) -> str | None:
@@ -243,6 +292,9 @@ class SessionManager:
             logger.debug(f"会话 {session.session_id} 需要加载窗口: {missing_windows}")
             await self._load_windows(session, missing_windows)
 
+            # 更新分片可用性
+            await self.playlist_generator.update_segment_availability(session)
+
     async def _load_windows(
         self, session: PlaybackSession, window_ids: list[int]
     ) -> None:
@@ -299,7 +351,6 @@ class SessionManager:
 
     async def _cleanup_expired_sessions(self) -> None:
         """清理过期的会话"""
-        current_time = time.time()
         expired_sessions = []
 
         for session_id, session in self.sessions.items():

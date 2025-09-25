@@ -9,6 +9,8 @@ import logging
 import shutil
 from pathlib import Path
 
+import aiofiles
+
 from app.models.window import (
     CacheStats,
     TranscodeProfile,
@@ -190,6 +192,11 @@ class JITTranscoder:
                 )
                 cache.file_size_bytes = await self._calculate_dir_size(output_dir)
                 self.cache_index[cache_key] = cache
+                # 在保存前设置转码信息到缓存对象
+                cache.input_file_path = str(window.input_file)
+                cache.start_time = window.start_time
+                cache.duration = window.duration
+                cache.profile_config = profile.__dict__
                 await self._save_cache_metadata(cache)
 
                 return f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8"
@@ -325,13 +332,8 @@ class JITTranscoder:
             "2",  # 双声道
             "-b:a",
             profile.audio_bitrate,
-            # 时间戳处理
-            "-fflags",
-            "+genpts",  # 生成展示时间戳
-            "-avoid_negative_ts",
-            "make_zero",  # 避免负时间戳
-            "-af",
-            "aresample=async=1:first_pts=0",  # 音频重采样滤镜
+            "-output_ts_offset",
+            str(window.start_time),
             # HLS 输出设置
             "-f",
             "hls",
@@ -392,7 +394,6 @@ class JITTranscoder:
                         cache_key = (asset_hash, profile_hash, window_id)
                         self.cache_index[cache_key] = cache
                         count += 1
-
                     except Exception as e:
                         logger.warning(f"加载缓存失败 {window_dir}: {e}")
 
@@ -427,6 +428,12 @@ class JITTranscoder:
                     cache.hit_count = meta.get("hit_count", 0)
                     cache.last_access = meta.get("last_access_ts", cache.created_at)
                     cache.file_size_bytes = meta.get("bytes_total", 0)
+
+                    # 加载转码信息
+                    cache.input_file_path = meta.get("input_file")
+                    cache.start_time = meta.get("start_time")
+                    cache.duration = meta.get("duration")
+                    cache.profile_config = meta.get("profile_config")
             except Exception as e:
                 logger.warning(f"读取元数据失败 {meta_file}: {e}")
 
@@ -436,11 +443,17 @@ class JITTranscoder:
 
         return cache
 
-    async def _save_cache_metadata(self, cache: WindowCache) -> None:
+    async def _save_cache_metadata(
+        self,
+        cache: WindowCache,
+        window: TranscodeWindow | None = None,
+        profile: TranscodeProfile | None = None,
+    ) -> None:
         """保存缓存元数据"""
         meta_file = cache.cache_dir / "index.meta.json"
 
         try:
+            # 构建基础元数据
             meta = {
                 "hit_count": cache.hit_count,
                 "last_access_ts": cache.last_access,
@@ -448,11 +461,49 @@ class JITTranscoder:
                 "created_at": cache.created_at,
             }
 
-            with meta_file.open("w") as f:
-                json.dump(meta, f, indent=2)
+            # 从 WindowCache 对象直接获取转码信息，避免文件读取
+            if cache.input_file_path:
+                meta["input_file"] = cache.input_file_path
+            if cache.start_time is not None:
+                meta["start_time"] = cache.start_time
+            if cache.duration is not None:
+                meta["duration"] = cache.duration
+            if cache.profile_config:
+                meta["profile_config"] = cache.profile_config
+
+            # 如果提供了新的窗口和配置信息，更新到 cache 对象并覆盖元数据
+            if window and profile:
+                cache.input_file_path = str(window.input_file)
+                cache.start_time = window.start_time
+                cache.duration = window.duration
+                cache.profile_config = profile.__dict__
+
+                meta.update(
+                    {
+                        "input_file": str(window.input_file),
+                        "start_time": window.start_time,
+                        "duration": window.duration,
+                        "profile_config": profile.__dict__,
+                    }
+                )
+
+            # 原子性写入：先写临时文件，再重命名
+            temp_file = meta_file.with_suffix(".tmp")
+            async with aiofiles.open(temp_file, "w") as f:
+                await f.write(json.dumps(meta, indent=2))
+
+            # 原子性重命名
+            temp_file.rename(meta_file)
 
         except Exception as e:
             logger.warning(f"保存元数据失败 {meta_file}: {e}")
+            # 清理可能的临时文件
+            try:
+                temp_file = meta_file.with_suffix(".tmp")
+                if temp_file.exists():
+                    temp_file.unlink()
+            except Exception:
+                pass
 
     async def _calculate_dir_size(self, directory: Path) -> int:
         """计算目录大小"""
@@ -534,6 +585,193 @@ class JITTranscoder:
             return file_path
 
         return None
+
+    async def get_transcoding_info(
+        self, asset_hash: str, profile_hash: str, window_id: int
+    ) -> tuple[Path | None, float, float, TranscodeProfile | None]:
+        """
+        从缓存获取转码信息（高性能版本，直接从内存获取）
+
+        Args:
+            asset_hash: 资产哈希
+            profile_hash: 配置哈希
+            window_id: 窗口ID
+
+        Returns:
+            tuple: (输入文件路径, 开始时间, 持续时间, 转码配置) 或 (None, 0, 0, None)
+        """
+        # 尝试从缓存索引获取
+        await self._ensure_cache_loaded()
+        cache_key = (asset_hash, profile_hash, window_id)
+
+        if cache_key in self.cache_index:
+            cache = self.cache_index[cache_key]
+
+            # 直接从 WindowCache 对象获取转码信息（高性能）
+            if cache.input_file_path:
+                input_file = Path(cache.input_file_path)
+                start_time = cache.start_time or 0.0
+                duration = cache.duration or 12.0
+
+                # 重建转码配置
+                if cache.profile_config:
+                    try:
+                        profile = TranscodeProfile(**cache.profile_config)
+                    except Exception as e:
+                        logger.warning(f"重建转码配置失败: {e}")
+                        profile = TranscodeProfile()
+                else:
+                    profile = TranscodeProfile()
+
+                if input_file.exists():
+                    return input_file, start_time, duration, profile
+                logger.warning(f"原始文件不存在: {input_file}")
+
+        # 尝试从缓存目录直接读取（向后兼容）
+        cache_path = get_cache_path(
+            self.cache_root, asset_hash, profile_hash, window_id
+        )
+        meta_file = cache_path / "index.meta.json"
+
+        if meta_file.exists():
+            try:
+                with meta_file.open() as f:
+                    meta = json.load(f)
+
+                input_file_str = meta.get("input_file")
+                if input_file_str:
+                    input_file = Path(input_file_str)
+                    start_time = meta.get("start_time", 0.0)
+                    duration = meta.get("duration", 12.0)
+
+                    profile_config = meta.get("profile_config")
+                    if profile_config:
+                        profile = TranscodeProfile(**profile_config)
+                    else:
+                        profile = TranscodeProfile()
+
+                    if input_file.exists():
+                        return input_file, start_time, duration, profile
+
+            except Exception as e:
+                logger.warning(f"读取缓存元数据失败 {meta_file}: {e}")
+
+        return None, 0.0, 0.0, None
+
+    async def start_background_transcoding(
+        self,
+        input_file: Path,
+        start_time: float,
+        duration: float,
+        profile: TranscodeProfile,
+    ) -> bool:
+        """
+        启动后台转码任务（不等待完成）
+
+        Args:
+            input_file: 输入文件路径
+            start_time: 窗口开始时间（秒）
+            duration: 窗口时长（秒）
+            profile: 转码配置
+
+        Returns:
+            bool: 是否成功启动转码任务
+        """
+        try:
+            # 计算哈希值
+            asset_hash = calculate_asset_hash(input_file)
+            profile_hash = calculate_profile_hash(profile.__dict__, profile.version)
+            window_id = calculate_window_id(start_time, profile.window_duration)
+
+            cache_key = (asset_hash, profile_hash, window_id)
+
+            # 检查是否已经在转码或已缓存
+            if await self._check_cache_hit(cache_key):
+                logger.info(f"窗口 {window_id} 已缓存，无需后台转码")
+                return True
+
+            if cache_key in self.running_windows:
+                logger.info(f"窗口 {window_id} 已在转码队列中")
+                return True
+
+            # 创建输出目录
+            output_dir = get_cache_path(
+                self.cache_root, asset_hash, profile_hash, window_id
+            )
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # 创建转码窗口
+            window = TranscodeWindow(
+                window_id=window_id,
+                asset_hash=asset_hash,
+                profile_hash=profile_hash,
+                input_file=input_file,
+                start_time=start_time,
+                duration=duration,
+                output_dir=output_dir,
+            )
+
+            self.running_windows[cache_key] = window
+
+            # 创建后台转码任务（不等待完成）
+            future = asyncio.create_task(
+                self._background_transcode_window(window, profile, cache_key)
+            )
+            window.future = future
+
+            logger.info(f"已启动窗口 {window_id} 后台转码任务")
+            return True
+
+        except Exception as e:
+            logger.error(f"启动后台转码失败: {e}")
+            return False
+
+    async def _background_transcode_window(
+        self,
+        window: TranscodeWindow,
+        profile: TranscodeProfile,
+        cache_key: tuple[str, str, int],
+    ) -> None:
+        """
+        执行后台转码任务
+        """
+        try:
+            # 执行转码
+            await self._transcode_window(window, profile)
+
+            if window.is_completed:
+                # 添加到缓存索引
+                cache = WindowCache(
+                    window_id=window.window_id,
+                    asset_hash=window.asset_hash,
+                    profile_hash=window.profile_hash,
+                    cache_dir=window.output_dir,
+                    playlist_path=window.playlist_path,
+                )
+                cache.file_size_bytes = await self._calculate_dir_size(
+                    window.output_dir
+                )
+                self.cache_index[cache_key] = cache
+                # 在保存前设置转码信息到缓存对象
+                cache.input_file_path = str(window.input_file)
+                cache.start_time = window.start_time
+                cache.duration = window.duration
+                cache.profile_config = profile.__dict__
+                await self._save_cache_metadata(cache)
+
+                logger.info(f"后台转码窗口 {window.window_id} 完成")
+            else:
+                logger.error(
+                    f"后台转码窗口 {window.window_id} 失败: {window.error_message}"
+                )
+
+        except Exception as e:
+            logger.error(f"后台转码窗口 {window.window_id} 异常: {e}")
+
+        finally:
+            # 清理运行状态
+            if cache_key in self.running_windows:
+                del self.running_windows[cache_key]
 
     def shutdown(self) -> None:
         """关闭转码器"""

@@ -7,7 +7,7 @@ import pathlib
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.api.deps import (
     CacheManager,
@@ -98,9 +98,6 @@ async def transcode_window(
 
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"JIT 转码失败: {e}")
-        raise HTTPException(status_code=500, detail=f"转码失败: {str(e)}")
 
 
 @router.get("/hls/{asset_hash}/{profile_hash}/{window_id}/{file_name}")
@@ -118,38 +115,64 @@ async def serve_hls_file(
     - 支持 m3u8 播放列表和 ts 分片文件
     - 直接从缓存目录读取文件
     """
-    try:
-        # 获取文件路径
-        file_path = jit_transcoder.get_window_url(
-            asset_hash, profile_hash, int(window_id), file_name
-        )
+    # 获取文件路径
+    file_path = jit_transcoder.get_window_url(
+        asset_hash, profile_hash, int(window_id), file_name
+    )
 
-        if not file_path or not file_path.exists():
-            raise HTTPException(status_code=404, detail="文件不存在")
+    if not file_path or not file_path.exists():
+        # 尝试从元数据获取转码信息并启动后台转码
+        try:
+            (
+                input_file,
+                _,
+                duration,
+                profile,
+            ) = await jit_transcoder.get_transcoding_info(
+                asset_hash, profile_hash, 0
+            )  # 从第一个窗口中获取，转码原数据
 
-        # 确定媒体类型
-        if file_name.endswith(".m3u8"):
-            media_type = "application/vnd.apple.mpegurl"
-        elif file_name.endswith(".ts"):
-            media_type = "video/mp2t"
-        elif file_name.endswith((".m4s", ".mp4")):
-            # fMP4 分段和初始化文件
-            media_type = "video/mp4"
-        else:
-            media_type = "application/octet-stream"
+            if input_file and profile:
+                # 根据 window_id 重新计算正确的 start_time
+                correct_start_time = int(window_id) * profile.window_duration
+                # 启动后台转码任务
+                success = await jit_transcoder.start_background_transcoding(
+                    input_file, correct_start_time, duration, profile
+                )
+                if success:
+                    logger.info(
+                        f"已为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码"
+                    )
+                else:
+                    logger.warning(
+                        f"为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码失败"
+                    )
+            else:
+                logger.warning(f"{input_file}")
+        except Exception as e:
+            logger.warning(f"尝试启动后台转码时出错: {e}")
 
-        return FileResponse(
-            file_path,
-            media_type=media_type,
-            headers={
-                "Cache-Control": "public, max-age=3600",  # 缓存1小时
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
+        return Response(status_code=503, headers={"Retry-After": "3"})
 
-    except Exception as e:
-        logger.error(f"提供 HLS 文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"文件服务错误: {str(e)}")
+    # 确定媒体类型
+    if file_name.endswith(".m3u8"):
+        media_type = "application/vnd.apple.mpegurl"
+    elif file_name.endswith(".ts"):
+        media_type = "video/mp2t"
+    elif file_name.endswith((".m4s", ".mp4")):
+        # fMP4 分段和初始化文件
+        media_type = "video/mp4"
+    else:
+        media_type = "application/octet-stream"
+
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=3600",  # 缓存1小时
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @router.get("/cache/stats", response_model=CacheStatsResponse)
@@ -164,23 +187,18 @@ async def get_cache_stats(
     - 命中率统计
     - LRU 候选信息
     """
-    try:
-        stats = await cache_manager.get_detailed_stats(jit_transcoder)
+    stats = await cache_manager.get_detailed_stats(jit_transcoder)
 
-        return CacheStatsResponse(
-            total_windows=stats.total_windows,
-            total_size_bytes=stats.total_size_bytes,
-            total_size_mb=round(stats.total_size_bytes / (1024 * 1024), 2),
-            total_hit_count=stats.total_hit_count,
-            avg_window_size=stats.avg_window_size,
-            cache_hit_rate=stats.cache_hit_rate,
-            oldest_window_age=stats.oldest_window_age,
-            lru_candidates=stats.lru_candidates,
-        )
-
-    except Exception as e:
-        logger.error(f"获取缓存统计失败: {e}")
-        raise HTTPException(status_code=500, detail=f"统计错误: {str(e)}")
+    return CacheStatsResponse(
+        total_windows=stats.total_windows,
+        total_size_bytes=stats.total_size_bytes,
+        total_size_mb=round(stats.total_size_bytes / (1024 * 1024), 2),
+        total_hit_count=stats.total_hit_count,
+        avg_window_size=stats.avg_window_size,
+        cache_hit_rate=stats.cache_hit_rate,
+        oldest_window_age=stats.oldest_window_age,
+        lru_candidates=stats.lru_candidates,
+    )
 
 
 @router.post("/cache/cleanup", response_model=CacheCleanupResponse)
@@ -197,45 +215,40 @@ async def cleanup_cache(
     - age: 按年龄清理
     - pattern: 按模式清理
     """
-    try:
-        removed_windows = 0
-        freed_bytes = 0
+    removed_windows = 0
+    freed_bytes = 0
 
-        if request.strategy == "lru":
-            removed_windows, freed_bytes = await cache_manager.enforce_cache_limits(
-                jit_transcoder
-            )
-
-        elif request.strategy == "age":
-            if not request.max_age_hours:
-                raise HTTPException(
-                    status_code=400, detail="age 策略需要提供 max_age_hours"
-                )
-            removed_windows = await cache_manager.cleanup_by_age(
-                jit_transcoder, request.max_age_hours
-            )
-
-        elif request.strategy == "pattern":
-            removed_windows = await cache_manager.cleanup_by_pattern(
-                jit_transcoder, request.asset_hash
-            )
-
-        else:
-            raise HTTPException(
-                status_code=400, detail=f"不支持的清理策略: {request.strategy}"
-            )
-
-        return CacheCleanupResponse(
-            success=True,
-            strategy=request.strategy,
-            removed_windows=removed_windows,
-            freed_bytes=freed_bytes,
-            freed_mb=round(freed_bytes / (1024 * 1024), 2),
+    if request.strategy == "lru":
+        removed_windows, freed_bytes = await cache_manager.enforce_cache_limits(
+            jit_transcoder
         )
 
-    except Exception as e:
-        logger.error(f"缓存清理失败: {e}")
-        raise HTTPException(status_code=500, detail=f"清理错误: {str(e)}")
+    elif request.strategy == "age":
+        if not request.max_age_hours:
+            raise HTTPException(
+                status_code=400, detail="age 策略需要提供 max_age_hours"
+            )
+        removed_windows = await cache_manager.cleanup_by_age(
+            jit_transcoder, request.max_age_hours
+        )
+
+    elif request.strategy == "pattern":
+        removed_windows = await cache_manager.cleanup_by_pattern(
+            jit_transcoder, request.asset_hash
+        )
+
+    else:
+        raise HTTPException(
+            status_code=400, detail=f"不支持的清理策略: {request.strategy}"
+        )
+
+    return CacheCleanupResponse(
+        success=True,
+        strategy=request.strategy,
+        removed_windows=removed_windows,
+        freed_bytes=freed_bytes,
+        freed_mb=round(freed_bytes / (1024 * 1024), 2),
+    )
 
 
 @router.get("/window/{asset_hash}/{profile_hash}/{window_id:06d}/status")
@@ -251,48 +264,41 @@ async def get_window_status(
     - 显示窗口转码状态
     - 文件大小和缓存信息
     """
-    try:
-        # 检查缓存
-        cache_key = (asset_hash, profile_hash, window_id)
-        await jit_transcoder._ensure_cache_loaded()
+    # 检查缓存
+    cache_key = (asset_hash, profile_hash, window_id)
+    await jit_transcoder._ensure_cache_loaded()
 
-        if cache_key in jit_transcoder.cache_index:
-            cache = jit_transcoder.cache_index[cache_key]
-            return WindowStatusResponse(
-                window_id=window_id,
-                asset_hash=asset_hash,
-                profile_hash=profile_hash,
-                status="cached",
-                created_at=cache.created_at,
-                duration_seconds=cache.get_age_seconds(),
-                cached=True,
-                file_size_bytes=cache.file_size_bytes,
-                playlist_url=f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8",
-            )
+    if cache_key in jit_transcoder.cache_index:
+        cache = jit_transcoder.cache_index[cache_key]
+        return WindowStatusResponse(
+            window_id=window_id,
+            asset_hash=asset_hash,
+            profile_hash=profile_hash,
+            status="cached",
+            created_at=cache.created_at,
+            duration_seconds=cache.get_age_seconds(),
+            cached=True,
+            file_size_bytes=cache.file_size_bytes,
+            playlist_url=f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/index.m3u8",
+        )
 
-        # 检查运行中的任务
-        if cache_key in jit_transcoder.running_windows:
-            window = jit_transcoder.running_windows[cache_key]
-            return WindowStatusResponse(
-                window_id=window_id,
-                asset_hash=asset_hash,
-                profile_hash=profile_hash,
-                status=window.status.value,
-                created_at=window.created_at,
-                duration_seconds=window.duration_seconds,
-                cached=False,
-                file_size_bytes=0,
-                playlist_url=None,
-            )
+    # 检查运行中的任务
+    if cache_key in jit_transcoder.running_windows:
+        window = jit_transcoder.running_windows[cache_key]
+        return WindowStatusResponse(
+            window_id=window_id,
+            asset_hash=asset_hash,
+            profile_hash=profile_hash,
+            status=window.status.value,
+            created_at=window.created_at,
+            duration_seconds=window.duration_seconds,
+            cached=False,
+            file_size_bytes=0,
+            playlist_url=None,
+        )
 
-        # 窗口不存在
-        raise HTTPException(status_code=404, detail="窗口不存在")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"获取窗口状态失败: {e}")
-        raise HTTPException(status_code=500, detail=f"状态查询错误: {str(e)}")
+    # 窗口不存在
+    raise HTTPException(status_code=404, detail="窗口不存在")
 
 
 @router.get("/config")
@@ -306,17 +312,12 @@ async def get_config(
     - 显示当前配置参数
     - 缓存管理设置
     """
-    try:
-        return {
-            "cache_config": cache_manager.get_config(),
-            "transcoder_config": {
-                "cache_root": str(jit_transcoder.cache_root),
-                "max_concurrent": jit_transcoder.max_concurrent,
-                "running_tasks": len(jit_transcoder.running_windows),
-                "cache_loaded": jit_transcoder.cache_loaded,
-            },
-        }
-
-    except Exception as e:
-        logger.error(f"获取配置失败: {e}")
-        raise HTTPException(status_code=500, detail=f"配置错误: {str(e)}")
+    return {
+        "cache_config": cache_manager.get_config(),
+        "transcoder_config": {
+            "cache_root": str(jit_transcoder.cache_root),
+            "max_concurrent": jit_transcoder.max_concurrent,
+            "running_tasks": len(jit_transcoder.running_windows),
+            "cache_loaded": jit_transcoder.cache_loaded,
+        },
+    }
