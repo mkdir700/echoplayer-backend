@@ -98,8 +98,8 @@ class PlaylistSegment:
             return []
 
         lines = []
-        # if self.discontinuity_before:
-        #     lines.append("#EXT-X-DISCONTINUITY")
+        if self.discontinuity_before:
+            lines.append("#EXT-X-DISCONTINUITY")
         lines.append(f"#EXTINF:{self.duration:.1f},")
         lines.append(self.url)
         return lines
@@ -127,7 +127,7 @@ class SessionPlaylist:
     def to_m3u8(self) -> str:
         """生成m3u8播放列表内容
 
-        优化版本：为每个窗口使用独立的初始化段，确保跨窗口播放平滑
+        优化版本：使用全局统一EXT-X-MAP，减少DISCONTINUITY标记
         """
         # 计算实际的最大片段时长，避免0.0时长问题
         if self.segments:
@@ -148,28 +148,24 @@ class SessionPlaylist:
 
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
 
+        # 添加全局统一的fMP4初始化段引用
         if self.segments:
+            # 使用第一个窗口的init.mp4作为全局初始化段
+            # 由于编码参数已统一，所有窗口的init.mp4兼容
+            first_segment = self.segments[0]
+            init_path = self._get_init_segment_path(first_segment.url)
+            if init_path:
+                lines.append(f'#EXT-X-MAP:URI="{init_path}"')
+
             # 添加独立片段标记（用于更好的seek支持）
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
 
             lines.append(f"#EXT-X-MEDIA-SEQUENCE:{self.sequence_number}")
 
-        # 添加片段 - 为每个窗口使用独立的初始化段
-        current_window_id = None
+        # 添加片段 - 优化后减少了不必要的DISCONTINUITY
         for segment in self.segments:
-            segment_lines = []
-
-            # 检查是否需要添加新的初始化段
-            if segment.window_id != current_window_id:
-                # 新窗口，添加对应的初始化段
-                init_path = self._get_init_segment_path(segment.url)
-                if init_path:
-                    segment_lines.append(f'#EXT-X-MAP:URI="{init_path}"')
-                current_window_id = segment.window_id
-
-            # 添加片段内容
-            segment_lines.extend(segment.to_m3u8_lines(include_unavailable=True))
-            lines.extend(segment_lines)
+            # 包含所有片段（包括未转码的），让客户端看到完整结构
+            lines.extend(segment.to_m3u8_lines(include_unavailable=True))
 
         lines.append("#EXT-X-ENDLIST")
 
