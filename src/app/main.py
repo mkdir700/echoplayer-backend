@@ -83,6 +83,11 @@ sessions_path = Path(settings.SESSIONS_ROOT)
 if sessions_path.exists():
     app.mount("/sessions", StaticFiles(directory=str(sessions_path)), name="sessions")
 
+# 挂载调试/静态资源，便于直接访问调试页面
+assets_path = Path(__file__).resolve().parents[2] / "assets"
+if assets_path.exists():
+    app.mount("/assets", StaticFiles(directory=str(assets_path)), name="assets")
+
 # 为分段转码添加片段文件服务支持
 # 注意：分段文件通过API路由 /api/segment/segments/{segment_id}/{file_name} 提供
 
@@ -111,6 +116,21 @@ async def file_not_found_handler(request, exc):
             error="FileNotFound",
             message=str(exc),
             details={"suggestion": "请检查文件路径是否正确"},
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def uncatch_error_handler(request, exc):
+    """处理未捕获的异常"""
+    _ = request
+    logger.exception(exc)
+    return JSONResponse(
+        status_code=404,
+        content=ErrorResponse(
+            error="InternalError",
+            message="内部异常",
+            details={"suggestion": "请查看日志文件"},
         ).model_dump(),
     )
 

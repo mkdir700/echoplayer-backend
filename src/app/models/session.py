@@ -55,6 +55,28 @@ class WindowReference:
 
 
 @dataclass
+class PrecomputedSegment:
+    """预计算的分片信息"""
+
+    segment_index: int  # 分片在窗口内的索引
+    window_id: int  # 所属窗口ID
+    start_time: float  # 分片开始时间
+    duration: float  # 分片时长
+    sequence_number: int  # 全局序列号
+
+    @property
+    def url(self) -> str:
+        """生成分片URL"""
+        # 这将在SessionPlaylistGenerator中填充实际的asset_hash和profile_hash
+        return f"seg_{self.segment_index:05d}.m4s"
+
+    @property
+    def end_time(self) -> float:
+        """分片结束时间"""
+        return self.start_time + self.duration
+
+
+@dataclass
 class PlaylistSegment:
     """播放列表片段信息"""
 
@@ -63,12 +85,21 @@ class PlaylistSegment:
     sequence_number: int  # 序列号
     window_id: int  # 所属窗口ID
     discontinuity_before: bool = False  # 之前是否需要不连续标记
+    available: bool = True  # 片段是否已转码可用
 
-    def to_m3u8_lines(self) -> list[str]:
-        """转换为m3u8格式的行"""
+    def to_m3u8_lines(self, include_unavailable: bool = True) -> list[str]:
+        """转换为m3u8格式的行
+
+        Args:
+            include_unavailable: 是否包含未转码的片段
+        """
+        # 如果片段不可用且不包含未转码片段，返回空列表
+        if not self.available and not include_unavailable:
+            return []
+
         lines = []
-        if self.discontinuity_before:
-            lines.append("#EXT-X-DISCONTINUITY")
+        # if self.discontinuity_before:
+        #     lines.append("#EXT-X-DISCONTINUITY")
         lines.append(f"#EXTINF:{self.duration:.1f},")
         lines.append(self.url)
         return lines
@@ -96,11 +127,13 @@ class SessionPlaylist:
     def to_m3u8(self) -> str:
         """生成m3u8播放列表内容
 
-        优化版本：使用全局统一EXT-X-MAP，减少DISCONTINUITY标记
+        优化版本：为每个窗口使用独立的初始化段，确保跨窗口播放平滑
         """
         # 计算实际的最大片段时长，避免0.0时长问题
         if self.segments:
-            valid_durations = [seg.duration for seg in self.segments if seg.duration > 0]
+            valid_durations = [
+                seg.duration for seg in self.segments if seg.duration > 0
+            ]
             max_duration = max(valid_durations, default=self.target_duration)
         else:
             max_duration = self.target_duration
@@ -113,32 +146,32 @@ class SessionPlaylist:
             f"#EXT-X-TARGETDURATION:{target_duration}",
         ]
 
-        # 根据是否完整决定播放列表类型
-        if not self.is_live:
-            lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-        else:
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
 
-        # 添加全局统一的fMP4初始化段引用
         if self.segments:
-            # 使用第一个窗口的init.mp4作为全局初始化段
-            # 由于编码参数已统一，所有窗口的init.mp4兼容
-            first_segment = self.segments[0]
-            init_path = self._get_init_segment_path(first_segment.url)
-            if init_path:
-                lines.append(f'#EXT-X-MAP:URI="{init_path}"')
-
             # 添加独立片段标记（用于更好的seek支持）
             lines.append("#EXT-X-INDEPENDENT-SEGMENTS")
 
             lines.append(f"#EXT-X-MEDIA-SEQUENCE:{self.sequence_number}")
 
-        # 添加片段 - 优化后减少了不必要的DISCONTINUITY
+        # 添加片段 - 为每个窗口使用独立的初始化段
+        current_window_id = None
         for segment in self.segments:
-            lines.extend(segment.to_m3u8_lines())
+            segment_lines = []
 
-        if not self.is_live:
-            lines.append("#EXT-X-ENDLIST")
+            # 检查是否需要添加新的初始化段
+            if segment.window_id != current_window_id:
+                # 新窗口，添加对应的初始化段
+                init_path = self._get_init_segment_path(segment.url)
+                if init_path:
+                    segment_lines.append(f'#EXT-X-MAP:URI="{init_path}"')
+                current_window_id = segment.window_id
+
+            # 添加片段内容
+            segment_lines.extend(segment.to_m3u8_lines(include_unavailable=True))
+            lines.extend(segment_lines)
+
+        lines.append("#EXT-X-ENDLIST")
 
         return "\n".join(lines)
 
@@ -147,11 +180,18 @@ class SessionPlaylist:
         try:
             # 片段URL格式: /api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/{segment_file}
             parts = segment_url.strip("/").split("/")
-            if len(parts) >= 7 and parts[0] == "api" and parts[1] == "v1" and parts[2] == "jit":
+            if (
+                len(parts) >= 7
+                and parts[0] == "api"
+                and parts[1] == "v1"
+                and parts[2] == "jit"
+            ):
                 asset_hash = parts[4]
                 profile_hash = parts[5]
                 window_id = parts[6]
-                return f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id}/init.mp4"
+                return (
+                    f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id}/init.mp4"
+                )
         except Exception:
             pass
         return None
