@@ -7,7 +7,7 @@ import pathlib
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from app.api.deps import (
     CacheManager,
@@ -121,7 +121,7 @@ async def serve_hls_file(
     )
 
     if not file_path or not file_path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在")
+        return Response(status_code=503, headers={"Retry-After": "10"})
 
     # 确定媒体类型
     if file_name.endswith(".m3u8"):
