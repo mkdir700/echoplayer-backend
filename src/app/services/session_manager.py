@@ -269,14 +269,7 @@ class SessionManager:
     async def _preload_initial_windows(self, session: PlaybackSession) -> None:
         """预加载初始窗口"""
         current_window_id = session.get_current_window_id()
-        required_windows = []
-
-        # 加载当前窗口及后续几个窗口
-        for offset in range(session.preload_window_count + 1):
-            window_id = current_window_id + offset
-            required_windows.append(window_id)
-
-        await self._load_windows(session, required_windows)
+        await self._load_windows(session, [current_window_id])
 
     async def _ensure_windows_available(self, session: PlaybackSession) -> None:
         """确保所需的窗口可用"""
