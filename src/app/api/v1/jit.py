@@ -123,14 +123,28 @@ async def serve_hls_file(
     if not file_path or not file_path.exists():
         # 尝试从元数据获取转码信息并启动后台转码
         try:
+            # 先查找现有的窗口，而不是硬编码使用窗口 0
+            existing_windows = await jit_transcoder.find_existing_windows(
+                asset_hash, profile_hash
+            )
+
+            if not existing_windows:
+                # 没有找到现有窗口
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No existing windows found for asset {asset_hash} with profile {profile_hash}",
+                )
+
+            # 使用第一个存在的窗口获取转码信息
+            first_window_id = existing_windows[0]
             (
                 input_file,
                 _,
                 duration,
                 profile,
             ) = await jit_transcoder.get_transcoding_info(
-                asset_hash, profile_hash, 0
-            )  # 从第一个窗口中获取，转码原数据
+                asset_hash, profile_hash, first_window_id
+            )  # 从找到的现有窗口中获取转码原数据
 
             if input_file and profile:
                 # 根据 window_id 重新计算正确的 start_time

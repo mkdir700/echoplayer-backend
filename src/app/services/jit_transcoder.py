@@ -658,6 +658,29 @@ class JITTranscoder:
 
         return None, 0.0, 0.0, None
 
+    async def find_existing_windows(
+        self, asset_hash: str, profile_hash: str
+    ) -> list[int]:
+        """
+        查找给定资产和配置的所有现有窗口ID
+
+        Args:
+            asset_hash: 资产哈希
+            profile_hash: 配置哈希
+
+        Returns:
+            list[int]: 现有窗口ID列表，按ID排序
+        """
+        await self._ensure_cache_loaded()
+
+        existing_windows = []
+        for cache_key in self.cache_index:
+            cache_asset_hash, cache_profile_hash, window_id = cache_key
+            if cache_asset_hash == asset_hash and cache_profile_hash == profile_hash:
+                existing_windows.append(window_id)
+
+        return sorted(existing_windows)
+
     async def start_background_transcoding(
         self,
         input_file: Path,
