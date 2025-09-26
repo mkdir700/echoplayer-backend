@@ -226,7 +226,7 @@ class PlaybackSession:
 
     # 配置
     max_windows_in_playlist: int = 10  # 播放列表中最大窗口数
-    preload_window_count: int = 2  # 预加载窗口数量
+    preload_window_count: int = 1  # 预加载窗口数量
     ttl_seconds: int = 3600  # 会话生存时间
 
     def is_expired(self) -> bool:
