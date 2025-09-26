@@ -7,7 +7,7 @@ import pathlib
 import time
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 
 from app.api.deps import (
     CacheManager,
@@ -121,9 +121,9 @@ async def serve_hls_file(
     )
 
     if not file_path or not file_path.exists():
-        # 尝试从元数据获取转码信息并启动后台转码
+        # 文件不存在，尝试立即转码
         try:
-            # 先查找现有的窗口，而不是硬编码使用窗口 0
+            # 先查找现有的窗口获取转码信息
             existing_windows = await jit_transcoder.find_existing_windows(
                 asset_hash, profile_hash
             )
@@ -132,7 +132,8 @@ async def serve_hls_file(
                 # 没有找到现有窗口
                 raise HTTPException(
                     status_code=404,
-                    detail=f"No existing windows found for asset {asset_hash} with profile {profile_hash}",
+                    detail=f"No existing windows found for asset {asset_hash} "
+                    f"with profile {profile_hash}",
                 )
 
             # 使用第一个存在的窗口获取转码信息
@@ -144,29 +145,47 @@ async def serve_hls_file(
                 profile,
             ) = await jit_transcoder.get_transcoding_info(
                 asset_hash, profile_hash, first_window_id
-            )  # 从找到的现有窗口中获取转码原数据
+            )
 
-            if input_file and profile:
-                # 根据 window_id 重新计算正确的 start_time
-                correct_start_time = int(window_id) * profile.window_duration
-                # 启动后台转码任务
-                success = await jit_transcoder.start_background_transcoding(
-                    input_file, correct_start_time, duration, profile
+            if not input_file or not profile:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Cannot get transcoding info for {asset_hash}/"
+                    f"{profile_hash}",
                 )
-                if success:
-                    logger.info(
-                        f"已为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码"
-                    )
-                else:
-                    logger.warning(
-                        f"为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 启动后台转码失败"
-                    )
-            else:
-                logger.warning(f"{input_file}")
-        except Exception as e:
-            logger.warning(f"尝试启动后台转码时出错: {e}")
 
-        return Response(status_code=503, headers={"Retry-After": "3"})
+            # 根据 window_id 重新计算正确的 start_time
+            correct_start_time = int(window_id) * profile.window_duration
+
+            # 立即启动转码并等待完成
+            logger.info(
+                f"开始为 {asset_hash}/{profile_hash}/{window_id}/"
+                f"{file_name} 同步转码"
+            )
+            playlist_url = await jit_transcoder.ensure_window(
+                input_file, correct_start_time, profile
+            )
+            logger.info(f"转码完成，播放列表: {playlist_url}")
+
+            # 重新获取文件路径
+            file_path = jit_transcoder.get_window_url(
+                asset_hash, profile_hash, int(window_id), file_name
+            )
+
+            if not file_path or not file_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Transcoding completed but file not found: {file_name}",
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"同步转码失败: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Transcoding failed: {str(e)}",
+            )
 
     # 确定媒体类型
     if file_name.endswith(".m3u8"):

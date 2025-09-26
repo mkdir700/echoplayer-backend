@@ -9,8 +9,6 @@ import sys
 from datetime import datetime
 from typing import Any
 
-from uvicorn.logging import DefaultFormatter
-
 
 class EchoPlayerFormatter(logging.Formatter):
     """EchoPlayer 统一日志格式化器"""
