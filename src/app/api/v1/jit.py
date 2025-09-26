@@ -20,6 +20,8 @@ from app.schemas.jit_request import (
     CacheCleanupRequest,
     CacheCleanupResponse,
     CacheStatsResponse,
+    FileCacheCleanupRequest,
+    FileCacheCleanupResponse,
     JITTranscodeRequest,
     JITTranscodeResponse,
     WindowStatusResponse,
@@ -247,9 +249,10 @@ async def cleanup_cache(
         )
 
     elif request.strategy == "pattern":
-        removed_windows = await cache_manager.cleanup_by_pattern(
+        removed_windows, pattern_freed_bytes = await cache_manager.cleanup_by_pattern(
             jit_transcoder, request.asset_hash
         )
+        freed_bytes += pattern_freed_bytes
 
     else:
         raise HTTPException(
@@ -313,6 +316,72 @@ async def get_window_status(
 
     # 窗口不存在
     raise HTTPException(status_code=404, detail="窗口不存在")
+
+
+@router.post("/cache/cleanup/file", response_model=FileCacheCleanupResponse)
+async def cleanup_file_cache(
+    request: FileCacheCleanupRequest,
+    jit_transcoder: JITTranscoder = Depends(get_jit_transcoder),
+    cache_manager: CacheManager = Depends(get_cache_manager),
+):
+    """
+    清空指定文件路径的所有缓存
+
+    - 根据文件路径计算资产哈希
+    - 删除该文件的所有转码缓存窗口
+    - 支持不同转码配置下的所有缓存
+    """
+    try:
+        # 检查文件是否存在
+        file_path = pathlib.Path(request.file_path)
+        if not file_path.exists():
+            return FileCacheCleanupResponse(
+                success=False,
+                file_path=request.file_path,
+                asset_hash=None,
+                removed_windows=0,
+                freed_bytes=0,
+                freed_mb=0.0,
+                message=f"文件不存在: {request.file_path}",
+            )
+
+        # 计算文件的资产哈希
+        asset_hash = calculate_asset_hash(file_path)
+
+        # 使用缓存管理器按模式清理（指定asset_hash）
+        removed_windows, freed_bytes = await cache_manager.cleanup_by_pattern(
+            jit_transcoder, asset_hash=asset_hash
+        )
+
+        freed_mb = round(freed_bytes / (1024 * 1024), 2)
+
+        message = (
+            f"成功清理文件 {request.file_path} 的缓存，删除了 {removed_windows} 个窗口"
+            if removed_windows > 0
+            else f"文件 {request.file_path} 没有找到任何缓存"
+        )
+
+        return FileCacheCleanupResponse(
+            success=True,
+            file_path=request.file_path,
+            asset_hash=asset_hash,
+            removed_windows=removed_windows,
+            freed_bytes=freed_bytes,
+            freed_mb=freed_mb,
+            message=message,
+        )
+
+    except Exception as e:
+        logger.error(f"清理文件缓存失败: {e}")
+        return FileCacheCleanupResponse(
+            success=False,
+            file_path=request.file_path,
+            asset_hash=None,
+            removed_windows=0,
+            freed_bytes=0,
+            freed_mb=0.0,
+            message=f"清理失败: {str(e)}",
+        )
 
 
 @router.get("/config")

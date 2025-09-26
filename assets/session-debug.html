@@ -62,6 +62,29 @@
           </div>
         </section>
 
+        <!-- 缓存管理 -->
+        <section
+          class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm"
+        >
+          <h2 class="text-lg font-medium mb-3">缓存管理</h2>
+          <div class="space-y-3">
+            <label class="block text-sm">
+              <span class="mb-1 block">文件路径</span>
+              <input
+                id="cacheFilePath"
+                placeholder="/path/to/video/file.mp4"
+                class="w-full text-sm px-2.5 py-2 rounded-md border border-slate-300"
+              />
+            </label>
+            <button
+              id="clearFileCache"
+              class="w-full text-sm px-2.5 py-2 rounded-md border border-orange-600 bg-orange-600 text-white font-semibold cursor-pointer hover:bg-orange-700 transition-colors"
+            >
+              清空文件缓存
+            </button>
+          </div>
+        </section>
+
         <!-- 创建会话 -->
         <section
           class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm"
@@ -299,6 +322,8 @@
       const windowDurationInput = document.getElementById("windowDuration");
       const createButton = document.getElementById("createSession");
       const checkHealthButton = document.getElementById("checkHealth");
+      const cacheFilePathInput = document.getElementById("cacheFilePath");
+      const clearFileCacheButton = document.getElementById("clearFileCache");
       const refreshInfoButton = document.getElementById("refreshInfo");
       const refreshPlaylistButton = document.getElementById("refreshPlaylist");
       const refreshPlaylistInfoButton = document.getElementById(
@@ -595,8 +620,31 @@
         }
       }
 
+      async function handleClearFileCache() {
+        const filePath = cacheFilePathInput.value.trim();
+        if (!filePath) {
+          alert("请填写文件路径");
+          return;
+        }
+        if (!confirm(`确认清空文件 "${filePath}" 的所有缓存吗?`)) return;
+        try {
+          clearFileCacheButton.disabled = true;
+          const data = await jsonRequest(
+            "POST",
+            "/jit/cache/cleanup/file",
+            { file_path: filePath }
+          );
+          log("清空文件缓存", data);
+        } catch (error) {
+          log("清空文件缓存失败", error.message, true);
+        } finally {
+          clearFileCacheButton.disabled = false;
+        }
+      }
+
       createButton.addEventListener("click", handleCreate);
       checkHealthButton.addEventListener("click", handleHealthCheck);
+      clearFileCacheButton.addEventListener("click", handleClearFileCache);
       refreshInfoButton.addEventListener("click", handleInfo);
       refreshPlaylistButton.addEventListener("click", handlePlaylist);
       refreshPlaylistInfoButton.addEventListener("click", handlePlaylistInfo);
@@ -607,7 +655,9 @@
       deleteButton.addEventListener("click", handleDelete);
 
       defaultFileInput.addEventListener("change", () => {
-        filePathInput.value = defaultFileInput.value.trim();
+        const filePath = defaultFileInput.value.trim();
+        filePathInput.value = filePath;
+        cacheFilePathInput.value = filePath;
       });
 
       document.addEventListener("DOMContentLoaded", () => {
@@ -615,6 +665,7 @@
         const defaultFile = defaultFileInput.value.trim();
         if (defaultFile) {
           filePathInput.value = defaultFile;
+          cacheFilePathInput.value = defaultFile;
         }
       });
     </script>
