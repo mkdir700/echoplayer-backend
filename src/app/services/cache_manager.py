@@ -219,7 +219,7 @@ class CacheManager:
 
     async def cleanup_by_pattern(
         self, jit_transcoder, asset_hash: str | None = None
-    ) -> int:
+    ) -> tuple[int, int]:
         """
         按模式清理缓存
 
@@ -228,15 +228,16 @@ class CacheManager:
             asset_hash: 指定资产哈希（如果提供，只清理该资产的缓存）
 
         Returns:
-            int: 删除的窗口数
+            tuple[int, int]: (删除的窗口数, 释放的字节数)
         """
         await jit_transcoder._ensure_cache_loaded()
 
         cache_index = jit_transcoder.cache_index
         if not cache_index:
-            return 0
+            return 0, 0
 
         removed_count = 0
+        freed_bytes = 0
         keys_to_remove = []
 
         for cache_key, cache in cache_index.items():
@@ -252,18 +253,27 @@ class CacheManager:
         for cache_key, cache in keys_to_remove:
             try:
                 if cache.cache_dir.exists():
+                    # 先记录文件大小
+                    cache_size = cache.file_size_bytes
                     shutil.rmtree(cache.cache_dir)
-                del cache_index[cache_key]
-                removed_count += 1
-                logger.debug(f"删除模式匹配缓存: {cache.cache_dir}")
+
+                    # 从索引中移除
+                    del cache_index[cache_key]
+                    removed_count += 1
+                    freed_bytes += cache_size
+                    logger.debug(
+                        f"删除模式匹配缓存: {cache.cache_dir}, 大小: {cache_size / (1024**2):.1f}MB"
+                    )
             except Exception as e:
                 logger.error(f"删除模式匹配缓存失败 {cache.cache_dir}: {e}")
 
         if removed_count > 0:
             pattern_desc = f"资产 {asset_hash}" if asset_hash else "所有"
-            logger.info(f"模式清理完成，删除 {removed_count} 个 {pattern_desc} 缓存")
+            logger.info(
+                f"模式清理完成，删除 {removed_count} 个 {pattern_desc} 缓存，释放 {freed_bytes / (1024**3):.2f}GB 空间"
+            )
 
-        return removed_count
+        return removed_count, freed_bytes
 
     async def get_detailed_stats(self, jit_transcoder) -> CacheStats:
         """

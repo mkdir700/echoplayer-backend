@@ -98,3 +98,21 @@ class WindowStatusResponse(BaseModel):
     cached: bool = Field(..., description="是否已缓存")
     file_size_bytes: int = Field(..., description="文件大小")
     playlist_url: str | None = Field(None, description="播放列表 URL")
+
+
+class FileCacheCleanupRequest(BaseModel):
+    """文件缓存清理请求"""
+
+    file_path: str = Field(..., description="要清理缓存的文件路径")
+
+
+class FileCacheCleanupResponse(BaseModel):
+    """文件缓存清理响应"""
+
+    success: bool = Field(..., description="是否成功")
+    file_path: str = Field(..., description="文件路径")
+    asset_hash: str | None = Field(None, description="文件资产哈希")
+    removed_windows: int = Field(..., description="删除的窗口数")
+    freed_bytes: int = Field(..., description="释放的字节数")
+    freed_mb: float = Field(..., description="释放的大小（MB）")
+    message: str = Field(..., description="详细信息")
