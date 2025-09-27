@@ -11,15 +11,18 @@ from pydantic import ValidationError
 
 from .api.router import router as api_router
 from .schemas.common import ErrorResponse
+from .services.audio_preprocessor import AudioPreprocessor
 from .services.cache_manager import CacheManager
 from .services.jit_transcoder import JITTranscoder
-from .services.preload_strategy import PreloadStrategy
 from .services.session_manager import SessionManager
-from .settings import settings
 from .utils.log_config import configure_uvicorn_logging, setup_logging
+from .config import ConfigManager
+
+config = ConfigManager()
+settings = config.app_settings
 
 # 配置统一日志系统
-setup_logging(level="INFO" if not settings.DEBUG else "DEBUG")
+setup_logging(level="INFO" if not settings.debug else "DEBUG")
 logger = logging.getLogger(__name__)
 
 
@@ -29,16 +32,27 @@ async def lifespan(app: FastAPI):
     _ = app
     # 启动时初始化
     logger.info("🚀 EchoPlayer 转码服务启动中...")
-    logger.info("📁 会话目录: %s", settings.SESSIONS_ROOT)
-    logger.info("🎬 FFmpeg 路径: %s", settings.FFMPEG_EXECUTABLE)
+    logger.info("📁 会话目录: %s", settings.sessions_root)
+    logger.info("🎬 FFmpeg 路径: %s", settings.ffmpeg_path)
+    logger.info("🎬 FFProbe 路径: %s", settings.ffprobe_path)
 
-    # 确保会话目录存在
-    settings.ensure_sessions_dir()
+    # 混合转码模式检查
+    if settings.enable_hybrid_mode:
+        logger.info("🎵 混合转码模式已启用")
+        logger.info("📁 音频缓存目录: %s", settings.audio_cache_root)
 
+    # 初始化核心服务
     jit_transcoder = JITTranscoder()
+
+    # 初始化音频预处理器（混合模式）
+    audio_preprocessor = None
+    if settings.enable_hybrid_mode:
+        audio_preprocessor = AudioPreprocessor()
+        await audio_preprocessor.start_background_tasks()
+        logger.info("🎵 音频预处理器已启动")
+
     cache_manager = CacheManager()
-    session_manager = SessionManager(jit_transcoder)
-    preload_strategy = PreloadStrategy(jit_transcoder)
+    session_manager = SessionManager(jit_transcoder, audio_preprocessor)
 
     # 启动后台清理任务
     cache_manager.start_background_cleanup(jit_transcoder)
@@ -50,7 +64,11 @@ async def lifespan(app: FastAPI):
 
     session_manager.shutdown()
     jit_transcoder.shutdown()
-    preload_strategy.shutdown()
+
+    # 关闭音频预处理器
+    if audio_preprocessor:
+        audio_preprocessor.shutdown()
+        logger.info("🎵 音频预处理器已关闭")
 
 
 # 创建 FastAPI 应用
@@ -79,7 +97,7 @@ app.add_middleware(
 app.include_router(api_router)
 
 # 挂载静态文件服务（用于 HLS 分片文件）
-sessions_path = Path(settings.SESSIONS_ROOT)
+sessions_path = Path(settings.sessions_root)
 if sessions_path.exists():
     app.mount("/sessions", StaticFiles(directory=str(sessions_path)), name="sessions")
 
@@ -145,10 +163,10 @@ def main():
 
     uvicorn.run(
         "app.main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.DEBUG,
-        log_level="info",
+        host=settings.host,
+        port=settings.port,
+        reload=settings.debug,
+        log_level="debug" if settings.debug else "info",
         access_log=True,
         log_config=None,  # 使用我们的自定义配置
     )

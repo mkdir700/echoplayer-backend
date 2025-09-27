@@ -13,12 +13,17 @@ class SessionCreateRequest(BaseModel):
     file_path: str = Field(..., description="视频文件路径")
     initial_time: float = Field(default=0.0, ge=0, description="初始播放时间（秒）")
 
-    # 转码配置（可选，使用默认值）
-    video_codec: str | None = Field(None, description="视频编码器")
-    video_preset: str | None = Field(None, description="编码预设")
-    video_bitrate: str | None = Field(None, description="视频码率")
-    hls_time: float | None = Field(None, gt=0, description="分片时长")
-    window_duration: float | None = Field(None, gt=0, description="窗口时长")
+    # 新的配置方式
+    quality: str = Field(default="720p", description="质量档位 (480p, 720p, 1080p)")
+    enable_hybrid: bool | None = Field(None, description="是否启用混合模式（None=自动检测）")
+    video_only: bool = Field(default=False, description="是否只转码视频")
+
+    # 兼容旧的转码配置（已废弃，但为了向后兼容保留）
+    video_codec: str | None = Field(None, description="视频编码器（已废弃）")
+    video_preset: str | None = Field(None, description="编码预设（已废弃）")
+    video_bitrate: str | None = Field(None, description="视频码率（已废弃）")
+    hls_time: float | None = Field(None, gt=0, description="分片时长（已废弃）")
+    window_duration: float | None = Field(None, gt=0, description="窗口时长（已废弃）")
 
 
 class SessionCreateResponse(BaseModel):

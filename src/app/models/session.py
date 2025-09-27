@@ -5,10 +5,12 @@
 
 import time
 import uuid
-from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from pydantic import BaseModel, Field, computed_field
+
+from .audio_track import AudioTrackProfile
 from .window import TranscodeProfile, WindowCache
 
 
@@ -21,20 +23,20 @@ class SessionStatus(str, Enum):
     ERROR = "error"  # 错误状态
 
 
-@dataclass
-class WindowReference:
+class WindowReference(BaseModel):
     """窗口引用信息"""
 
-    window_id: int  # 窗口ID
-    asset_hash: str  # 资产哈希
-    profile_hash: str  # 配置哈希
-    start_time: float  # 窗口开始时间（秒）
-    duration: float  # 窗口时长（秒）
-    end_time: float  # 窗口结束时间（秒）
-    segments: list[str] = field(default_factory=list)  # 片段文件名列表
-    ready: bool = False  # 是否已准备好
-    needs_discontinuity: bool = False  # 是否需要不连续标记
+    window_id: int = Field(description="窗口ID")
+    asset_hash: str = Field(description="资产哈希")
+    profile_hash: str = Field(description="配置哈希")
+    start_time: float = Field(description="窗口开始时间（秒）")
+    duration: float = Field(gt=0, description="窗口时长（秒）")
+    end_time: float = Field(description="窗口结束时间（秒）")
+    segments: list[str] = Field(default_factory=list, description="片段文件名列表")
+    ready: bool = Field(default=False, description="是否已准备好")
+    needs_discontinuity: bool = Field(default=False, description="是否需要不连续标记")
 
+    @computed_field
     @property
     def time_range(self) -> tuple[float, float]:
         """获取时间范围"""
@@ -54,38 +56,40 @@ class WindowReference:
         )
 
 
-@dataclass
-class PrecomputedSegment:
+class PrecomputedSegment(BaseModel):
     """预计算的分片信息"""
 
-    segment_index: int  # 分片在窗口内的索引
-    window_id: int  # 所属窗口ID
-    start_time: float  # 分片开始时间
-    duration: float  # 分片时长
-    sequence_number: int  # 全局序列号
+    segment_index: int = Field(description="分片在窗口内的索引")
+    window_id: int = Field(description="所属窗口ID")
+    start_time: float = Field(description="分片开始时间")
+    duration: float = Field(gt=0, description="分片时长")
+    sequence_number: int = Field(description="全局序列号")
 
+    @computed_field
     @property
     def url(self) -> str:
         """生成分片URL"""
         # 这将在SessionPlaylistGenerator中填充实际的asset_hash和profile_hash
         return f"seg_{self.segment_index:05d}.m4s"
 
+    @computed_field
     @property
     def end_time(self) -> float:
         """分片结束时间"""
         return self.start_time + self.duration
 
 
-@dataclass
-class PlaylistSegment:
+class PlaylistSegment(BaseModel):
     """播放列表片段信息"""
 
-    url: str  # 片段URL
-    duration: float  # 片段时长
-    sequence_number: int  # 序列号
-    window_id: int  # 所属窗口ID
-    discontinuity_before: bool = False  # 之前是否需要不连续标记
-    available: bool = True  # 片段是否已转码可用
+    url: str = Field(description="片段URL")
+    duration: float = Field(gt=0, description="片段时长")
+    sequence_number: int = Field(description="序列号")
+    window_id: int = Field(description="所属窗口ID")
+    discontinuity_before: bool = Field(
+        default=False, description="之前是否需要不连续标记"
+    )
+    available: bool = Field(default=True, description="片段是否已转码可用")
 
     def to_m3u8_lines(self, include_unavailable: bool = True) -> list[str]:
         """转换为m3u8格式的行
@@ -100,21 +104,51 @@ class PlaylistSegment:
         lines = []
         if self.discontinuity_before:
             lines.append("#EXT-X-DISCONTINUITY")
+            # 只有在真正不连续时才添加新的EXT-X-MAP
+            # 相邻窗口间已经没有DISCONTINUITY，所以不会到达这里
+            init_path = self._get_init_segment_path(self.url)
+            if init_path:
+                lines.append(f'#EXT-X-MAP:URI="{init_path}"')
         lines.append(f"#EXTINF:{self.duration:.1f},")
         lines.append(self.url)
         return lines
 
+    def _get_init_segment_path(self, segment_url: str) -> str | None:
+        """从片段URL推导出初始化段路径"""
+        try:
+            # 片段URL格式: /api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id:06d}/{segment_file}
+            parts = segment_url.strip("/").split("/")
+            if (
+                len(parts) >= 7
+                and parts[0] == "api"
+                and parts[1] == "v1"
+                and parts[2] == "jit"
+            ):
+                asset_hash = parts[4]
+                profile_hash = parts[5]
+                window_id = parts[6]
+                return (
+                    f"/api/v1/jit/hls/{asset_hash}/{profile_hash}/{window_id}/init.mp4"
+                )
+        except Exception:
+            pass
+        return None
 
-@dataclass
-class SessionPlaylist:
+
+class SessionPlaylist(BaseModel):
     """会话播放列表"""
 
-    session_id: str  # 会话ID
-    target_duration: float  # 目标片段时长
-    segments: list[PlaylistSegment] = field(default_factory=list)  # 片段列表
-    version: int = 6  # HLS版本
-    sequence_number: int = 0  # 媒体序列号
-    is_live: bool = False  # 是否为直播
+    session_id: str = Field(description="会话ID")
+    target_duration: float = Field(gt=0, description="目标片段时长")
+    segments: list[PlaylistSegment] = Field(
+        default_factory=list, description="片段列表"
+    )
+    version: int = Field(default=6, ge=1, description="HLS版本")
+    sequence_number: int = Field(default=0, ge=0, description="媒体序列号")
+    is_live: bool = Field(default=False, description="是否为直播")
+    # 混合模式音频支持
+    has_audio_track: bool = Field(default=False, description="是否有独立音频轨道")
+    audio_track_id: str | None = Field(default=None, description="音频轨道ID")
 
     def get_total_duration(self) -> float:
         """获取播放列表总时长"""
@@ -128,7 +162,39 @@ class SessionPlaylist:
         """生成m3u8播放列表内容
 
         优化版本：使用全局统一EXT-X-MAP，减少DISCONTINUITY标记
+        支持混合模式音频轨道
         """
+        # 检查是否为混合模式且有独立音频轨道
+        if self.has_audio_track and self.audio_track_id:
+            return self._generate_master_playlist()
+        return self._generate_media_playlist()
+
+    def _generate_master_playlist(self) -> str:
+        """生成主播放列表(Master Playlist)用于混合模式"""
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6"]
+
+        # 定义音频轨道
+        if self.audio_track_id:
+            audio_url = f"/api/v1/audio/{self.audio_track_id}/playlist.m3u8"
+            lines.extend(
+                [
+                    f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="default",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_url}"'
+                ]
+            )
+
+        # 定义视频流（只有视频，音频通过上面的音频轨道提供）
+        video_playlist_url = f"/api/v1/session/{self.session_id}/video.m3u8"
+        lines.extend(
+            [
+                '#EXT-X-STREAM-INF:BANDWIDTH=2000000,CODECS="avc1.64001e,mp4a.40.2",AUDIO="audio"',
+                video_playlist_url,
+            ]
+        )
+
+        return "\n".join(lines)
+
+    def _generate_media_playlist(self) -> str:
+        """生成媒体播放列表(Media Playlist)用于传统模式或混合模式的视频轨道"""
         # 计算实际的最大片段时长，避免0.0时长问题
         if self.segments:
             valid_durations = [
@@ -193,40 +259,61 @@ class SessionPlaylist:
         return None
 
 
-@dataclass
-class PlaybackSession:
+class PlaybackSession(BaseModel):
     """播放会话"""
 
-    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    file_path: Path = field(default_factory=lambda: Path())
-    asset_hash: str = ""
-    profile: TranscodeProfile = field(default_factory=TranscodeProfile)
-    profile_hash: str = ""
+    session_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()), description="会话ID"
+    )
+    file_path: Path = Field(default_factory=lambda: Path(), description="文件路径")
+    asset_hash: str = Field(default="", description="资产哈希")
+    profile: TranscodeProfile = Field(
+        default_factory=TranscodeProfile, description="转码配置"
+    )
+    profile_hash: str = Field(default="", description="配置哈希")
 
     # 会话状态
-    status: SessionStatus = SessionStatus.ACTIVE
-    created_at: float = field(default_factory=time.time)
-    last_access: float = field(default_factory=time.time)
-    expires_at: float = field(
-        default_factory=lambda: time.time() + 3600
-    )  # 默认1小时过期
+    status: SessionStatus = Field(default=SessionStatus.ACTIVE, description="会话状态")
+    created_at: float = Field(default_factory=time.time, description="创建时间")
+    last_access: float = Field(default_factory=time.time, description="最后访问时间")
+    expires_at: float = Field(
+        default_factory=lambda: time.time() + 3600, description="过期时间（默认1小时）"
+    )
 
     # 播放状态
-    current_time: float = 0.0  # 当前播放时间
-    duration: float | None = None  # 视频总时长
+    current_time: float = Field(default=0.0, ge=0, description="当前播放时间")
+    duration: float | None = Field(default=None, description="视频总时长")
 
     # 窗口管理
-    windows: dict[int, WindowReference] = field(default_factory=dict)  # 窗口引用
-    loaded_windows: set[int] = field(default_factory=set)  # 已加载的窗口
-    preloading_windows: set[int] = field(default_factory=set)  # 正在预加载的窗口
+    windows: dict[int, WindowReference] = Field(
+        default_factory=dict, description="窗口引用"
+    )
+    loaded_windows: set[int] = Field(default_factory=set, description="已加载的窗口")
+    preloading_windows: set[int] = Field(
+        default_factory=set, description="正在预加载的窗口"
+    )
 
     # 播放列表
-    playlist: SessionPlaylist | None = None
-    playlist_dirty: bool = True  # 播放列表是否需要重新生成
+    playlist: SessionPlaylist | None = Field(default=None, description="播放列表")
+    playlist_dirty: bool = Field(default=True, description="播放列表是否需要重新生成")
+
+    # 音频轨道管理（混合转码模式）
+    audio_track_id: str | None = Field(default=None, description="音频轨道标识符")
+    audio_profile: AudioTrackProfile | None = Field(
+        default=None, description="音频配置"
+    )
+    audio_track_ready: bool = Field(default=False, description="音频轨道是否已准备好")
+    hybrid_mode: bool = Field(default=False, description="是否启用混合转码模式")
 
     # 配置
-    max_windows_in_playlist: int = 10  # 播放列表中最大窗口数
-    preload_window_count: int = 1  # 预加载窗口数量
+    max_windows_in_playlist: int = Field(
+        default=10, ge=1, description="播放列表中最大窗口数"
+    )
+    preload_window_count: int = Field(default=1, ge=0, description="预加载窗口数量")
+
+    class Config:
+        arbitrary_types_allowed = True
+
     ttl_seconds: int = 3600  # 会话生存时间
 
     def is_expired(self) -> bool:
@@ -313,15 +400,38 @@ class PlaybackSession:
 
         return removed_windows
 
+    def enable_hybrid_mode(self, audio_track_id: str) -> None:
+        """启用混合转码模式"""
+        self.hybrid_mode = True
+        self.audio_track_id = audio_track_id
+        # 注意: profile.hybrid_mode 在创建时就已确定，不需要修改
+        self.playlist_dirty = True
 
-@dataclass
-class SessionStats:
+    def set_audio_track_ready(self, ready: bool = True) -> None:
+        """设置音频轨道就绪状态"""
+        if self.audio_track_ready != ready:
+            self.audio_track_ready = ready
+            # 音频轨道状态变化时，需要重新生成播放列表
+            self.playlist_dirty = True
+
+    def is_audio_ready(self) -> bool:
+        """检查音频轨道是否已准备好"""
+        if not self.hybrid_mode:
+            return True  # 非混合模式，不需要独立音频轨道
+        return self.audio_track_ready
+
+    def get_audio_track_identifier(self) -> str | None:
+        """获取音频轨道标识符"""
+        return self.audio_track_id if self.hybrid_mode else None
+
+
+class SessionStats(BaseModel):
     """会话统计信息"""
 
-    total_sessions: int = 0
-    active_sessions: int = 0
-    idle_sessions: int = 0
-    expired_sessions: int = 0
-    total_windows_loaded: int = 0
-    cache_hit_rate: float = 0.0
-    avg_session_duration: float = 0.0
+    total_sessions: int = Field(default=0, ge=0, description="总会话数")
+    active_sessions: int = Field(default=0, ge=0, description="活跃会话数")
+    idle_sessions: int = Field(default=0, ge=0, description="空闲会话数")
+    expired_sessions: int = Field(default=0, ge=0, description="过期会话数")
+    total_windows_loaded: int = Field(default=0, ge=0, description="已加载窗口总数")
+    cache_hit_rate: float = Field(default=0.0, ge=0, le=1, description="缓存命中率")
+    avg_session_duration: float = Field(default=0.0, ge=0, description="平均会话时长")

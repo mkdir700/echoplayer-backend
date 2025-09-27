@@ -4,7 +4,6 @@
 """
 
 import asyncio
-import json
 import logging
 import time
 from pathlib import Path
@@ -14,11 +13,9 @@ from app.models.session import (
     SessionStats,
     SessionStatus,
 )
-from app.models.window import TranscodeProfile
 from app.services.jit_transcoder import JITTranscoder
+from app.services.session_factory import SessionFactory
 from app.services.session_playlist_generator import SessionPlaylistGenerator
-from app.settings import settings
-from app.utils.hash import calculate_asset_hash, calculate_profile_hash
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +31,15 @@ class SessionManager:
             cls._instance = super().__new__(cls)
         return cls._instance
 
-    def __init__(self, jit_transcoder: JITTranscoder):
+    def __init__(self, jit_transcoder: JITTranscoder, audio_preprocessor=None):
         if self._initialized:
             return
 
         self.jit_transcoder = jit_transcoder
-        self.playlist_generator = SessionPlaylistGenerator(jit_transcoder)
+        self.session_factory = SessionFactory(audio_preprocessor)
+        self.playlist_generator = SessionPlaylistGenerator(
+            jit_transcoder, audio_preprocessor
+        )
 
         # 会话存储
         self.sessions: dict[str, PlaybackSession] = {}
@@ -57,85 +57,34 @@ class SessionManager:
         logger.info("会话管理器初始化完成")
         self._initialized = True
 
-    async def _get_video_duration(self, file_path: Path) -> float | None:
-        """获取视频文件时长
-
-        Args:
-            file_path: 视频文件路径
-
-        Returns:
-            视频时长（秒），如果获取失败返回None
-        """
-        try:
-            cmd = [
-                settings.FFPROBE_EXECUTABLE,
-                "-v",
-                "quiet",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "json",
-                str(file_path),
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                logger.error(f"ffprobe获取视频时长失败: {stderr.decode()}")
-                return None
-
-            result = json.loads(stdout.decode())
-            duration = float(result["format"]["duration"])
-            logger.debug(f"视频 {file_path} 时长: {duration:.1f}s")
-            return duration
-
-        except Exception as e:
-            logger.error(f"获取视频时长失败: {e}")
-            return None
-
     async def create_session(
         self,
         file_path: Path,
-        profile: TranscodeProfile | None = None,
+        quality: str = "720p",
         initial_time: float = 0.0,
+        enable_hybrid: bool | None = None,
+        video_only: bool = False,
     ) -> PlaybackSession:
         """
         创建新的播放会话
 
         Args:
             file_path: 视频文件路径
-            profile: 转码配置
+            quality: 质量档位 (480p, 720p, 1080p)
             initial_time: 初始播放时间
+            enable_hybrid: 是否启用混合模式（None=自动检测）
+            video_only: 是否只转码视频
 
         Returns:
             PlaybackSession: 创建的会话
         """
-        if not file_path.exists():
-            raise FileNotFoundError(f"文件不存在: {file_path}")
-
-        if profile is None:
-            profile = TranscodeProfile()
-
-        # 计算哈希值
-        asset_hash = calculate_asset_hash(file_path)
-        profile_hash = calculate_profile_hash(profile.__dict__, profile.version)
-
-        # 获取视频时长
-        duration = await self._get_video_duration(file_path)
-
-        # 创建会话
-        session = PlaybackSession(
+        # 使用SessionFactory创建会话，确保配置一致性
+        session = await self.session_factory.create_session(
             file_path=file_path,
-            asset_hash=asset_hash,
-            profile=profile,
-            profile_hash=profile_hash,
-            current_time=initial_time,
-            duration=duration,
-            expires_at=time.time() + self.session_timeout,
+            quality=quality,
+            initial_time=initial_time,
+            enable_hybrid=enable_hybrid,
+            video_only=video_only,
         )
 
         # 存储会话
@@ -246,6 +195,23 @@ class SessionManager:
             return None
 
         return playlist.to_m3u8()
+
+    async def get_session_video_playlist(self, session_id: str) -> str | None:
+        """获取会话的视频轨道播放列表内容（用于混合模式）"""
+        session = await self.get_session(session_id)
+        if not session:
+            return None
+
+        # 生成或更新播放列表
+        playlist = await self.playlist_generator.generate_playlist(session)
+
+        # 验证播放列表
+        if not await self.playlist_generator.validate_playlist(playlist):
+            logger.error(f"会话 {session_id} 播放列表验证失败")
+            return None
+
+        # 对于混合模式，强制生成媒体播放列表（只包含视频）
+        return playlist._generate_media_playlist()
 
     async def delete_session(self, session_id: str) -> bool:
         """删除会话"""

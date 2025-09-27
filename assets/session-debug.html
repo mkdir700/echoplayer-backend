@@ -28,9 +28,9 @@
     <h1 class="text-2xl font-semibold mb-4">EchoPlayer 会话调试控制台</h1>
 
     <!-- 主网格布局 -->
-    <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
+    <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4" style="height: calc(100vh - 120px);">
       <!-- 左栏：配置和创建 -->
-      <div class="space-y-4">
+      <div class="space-y-4 overflow-y-auto">
         <!-- 环境设置 -->
         <section
           class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm"
@@ -47,11 +47,17 @@
             </label>
             <label class="block text-sm">
               <span class="mb-1 block">默认视频文件路径</span>
-              <input
-                id="defaultFile"
-                placeholder="/path/to/video/file.mp4"
-                class="w-full text-sm px-2.5 py-2 rounded-md border border-slate-300"
-              />
+              <div class="relative">
+                <input
+                  id="defaultFile"
+                  placeholder="/path/to/video/file.mp4"
+                  class="w-full text-sm px-2.5 py-2 rounded-md border border-slate-300"
+                  list="fileHistoryList"
+                />
+                <datalist id="fileHistoryList">
+                  <!-- History options will be populated by JavaScript -->
+                </datalist>
+              </div>
             </label>
             <button
               id="checkHealth"
@@ -179,7 +185,7 @@
       </div>
 
       <!-- 中栏：会话控制和播放器 -->
-      <div class="space-y-4">
+      <div class="space-y-4 overflow-y-auto">
         <!-- 会话控制 -->
         <section
           class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm"
@@ -293,18 +299,58 @@
           <p id="playerStatus" class="text-sm mt-2 p-2 bg-gray-50 rounded">
             播放器尚未加载播放列表
           </p>
+
+          <!-- 播放器控制按钮 -->
+          <div class="mt-3 space-y-2">
+            <!-- Seek 控制 -->
+            <div class="flex gap-2 items-end">
+              <label class="block text-xs flex-1">
+                <span class="mb-1 block">Seek 到时间 (秒)</span>
+                <input
+                  id="playerSeekTime"
+                  type="number"
+                  min="0"
+                  step="1"
+                  class="w-full text-xs px-2 py-1.5 rounded border border-slate-300"
+                />
+              </label>
+              <button
+                id="playerSeekButton"
+                class="text-xs px-3 py-1.5 rounded border border-blue-600 bg-blue-600 text-white font-medium cursor-pointer hover:bg-blue-700 transition-colors"
+              >
+                Seek
+              </button>
+            </div>
+
+            <!-- 12*n-2 序列导航 -->
+            <div class="flex gap-2">
+              <button
+                id="prevSequenceButton"
+                class="flex-1 text-xs px-2 py-1.5 rounded border border-purple-600 bg-purple-600 text-white font-medium cursor-pointer hover:bg-purple-700 transition-colors"
+              >
+                ← 上一个 (12n-2)
+              </button>
+              <button
+                id="nextSequenceButton"
+                class="flex-1 text-xs px-2 py-1.5 rounded border border-purple-600 bg-purple-600 text-white font-medium cursor-pointer hover:bg-purple-700 transition-colors"
+              >
+                下一个 (12n-2) →
+              </button>
+            </div>
+
+          </div>
         </section>
       </div>
 
       <!-- 右栏：调试日志（占满高度） -->
       <div class="lg:col-span-2 xl:col-span-1">
         <section
-          class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm h-full"
+          class="bg-white border border-gray-300 rounded-lg p-4 shadow-sm h-full flex flex-col"
         >
           <h2 class="text-lg font-medium mb-3">调试日志</h2>
           <div
             id="log"
-            class="h-96 border border-gray-300 rounded-md p-3 bg-white"
+            class="flex-1 border border-gray-300 rounded-md p-3 bg-white overflow-y-auto"
           ></div>
         </section>
       </div>
@@ -340,16 +386,93 @@
       const videoElement = document.getElementById("video");
       const playerStatus = document.getElementById("playerStatus");
       const logContainer = document.getElementById("log");
+      const playerSeekInput = document.getElementById("playerSeekTime");
+      const playerSeekButton = document.getElementById("playerSeekButton");
+      const prevSequenceButton = document.getElementById("prevSequenceButton");
+      const nextSequenceButton = document.getElementById("nextSequenceButton");
 
       let currentSessionId = null;
       let currentPlaylistUrl = null;
       let hlsPlayer = null;
+
+      // localStorage keys for persistent storage
+      const STORAGE_KEYS = {
+        DEFAULT_FILE: 'echoplayer_default_file',
+        FILE_HISTORY: 'echoplayer_file_history',
+        API_BASE: 'echoplayer_api_base'
+      };
 
       function defaultApiBase() {
         const origin = window.location.origin;
         const fallback = "http://127.0.0.1:8799";
         const base = origin && origin !== "null" ? origin : fallback;
         return `${base.replace(/\/$/, "")}/api/v1`;
+      }
+
+      // localStorage helper functions
+      function saveToStorage(key, value) {
+        try {
+          localStorage.setItem(key, value);
+        } catch (error) {
+          console.error('Failed to save to localStorage:', error);
+        }
+      }
+
+      function getFromStorage(key, defaultValue = '') {
+        try {
+          return localStorage.getItem(key) || defaultValue;
+        } catch (error) {
+          console.error('Failed to read from localStorage:', error);
+          return defaultValue;
+        }
+      }
+
+      function saveFileHistory(filePath) {
+        if (!filePath.trim()) return;
+
+        try {
+          const history = JSON.parse(getFromStorage(STORAGE_KEYS.FILE_HISTORY, '[]'));
+
+          // Remove if already exists to avoid duplicates
+          const filtered = history.filter(item => item.path !== filePath);
+
+          // Add to beginning of array
+          filtered.unshift({
+            path: filePath,
+            timestamp: new Date().toISOString()
+          });
+
+          // Keep only last 10 items
+          const limited = filtered.slice(0, 10);
+
+          saveToStorage(STORAGE_KEYS.FILE_HISTORY, JSON.stringify(limited));
+        } catch (error) {
+          console.error('Failed to save file history:', error);
+        }
+      }
+
+      function getFileHistory() {
+        try {
+          return JSON.parse(getFromStorage(STORAGE_KEYS.FILE_HISTORY, '[]'));
+        } catch (error) {
+          console.error('Failed to get file history:', error);
+          return [];
+        }
+      }
+
+      function updateFileHistoryDropdown() {
+        const historyList = document.getElementById('fileHistoryList');
+        const history = getFileHistory();
+
+        // Clear existing options
+        historyList.innerHTML = '';
+
+        // Add history items as options
+        history.forEach(item => {
+          const option = document.createElement('option');
+          option.value = item.path;
+          historyList.appendChild(option);
+        });
       }
 
       function getApiBase() {
@@ -464,6 +587,10 @@
           alert("请填写文件路径");
           return;
         }
+
+        // Save file path to history when creating session
+        saveFileHistory(payload.file_path);
+        updateFileHistoryDropdown();
         if (videoCodecInput.value.trim())
           payload.video_codec = videoCodecInput.value.trim();
         if (videoPresetInput.value.trim())
@@ -627,6 +754,10 @@
           return;
         }
         if (!confirm(`确认清空文件 "${filePath}" 的所有缓存吗?`)) return;
+
+        // Save file path to history when clearing cache
+        saveFileHistory(filePath);
+        updateFileHistoryDropdown();
         try {
           clearFileCacheButton.disabled = true;
           const data = await jsonRequest(
@@ -642,6 +773,78 @@
         }
       }
 
+      async function handlePlayerSeek() {
+        const time = parseFloat(playerSeekInput.value);
+        if (Number.isNaN(time) || time < 0) {
+          alert("请输入有效的时间");
+          return;
+        }
+        if (!videoElement.duration) {
+          alert("视频尚未加载完成");
+          return;
+        }
+        try {
+          videoElement.currentTime = time;
+          log("播放器 Seek", { time: time, success: true });
+        } catch (error) {
+          log("播放器 Seek 失败", error.message, true);
+        }
+      }
+
+
+      // 12*n-2 序列计算函数
+      function calculateSequenceTime(currentTime, direction) {
+        // 12*n-2 序列: 10, 22, 34, 46, 58, 70, 82, 94, 106, 118...
+        // 即: 12*1-2=10, 12*2-2=22, 12*3-2=34, ...
+
+        if (direction === 'prev') {
+          // 找到上一个 12*n-2 的值
+          const n = Math.ceil((currentTime + 2) / 12) - 1;
+          return Math.max(0, n * 12 - 2);
+        } else {
+          // 找到下一个 12*n-2 的值
+          const n = Math.floor((currentTime + 2) / 12) + 1;
+          return n * 12 - 2;
+        }
+      }
+
+      async function handleSequenceSeek(direction) {
+        if (!videoElement.duration) {
+          alert("视频尚未加载完成");
+          return;
+        }
+
+        try {
+          const currentTime = videoElement.currentTime || 0;
+          const targetTime = calculateSequenceTime(currentTime, direction);
+
+          // 确保不超过视频长度
+          const clampedTime = Math.min(targetTime, videoElement.duration);
+
+          videoElement.currentTime = clampedTime;
+          playerSeekInput.value = clampedTime;
+
+          // 如果视频没有播放则自动播放
+          if (videoElement.paused) {
+            try {
+              await videoElement.play();
+              log(`自动播放`, { time: clampedTime.toFixed(1) });
+            } catch (playError) {
+              log(`自动播放失败`, playError.message, true);
+            }
+          }
+
+          log(`序列跳转 (${direction})`, {
+            from: currentTime.toFixed(1),
+            to: clampedTime.toFixed(1),
+            sequence: '12n-2',
+            success: true
+          });
+        } catch (error) {
+          log(`序列跳转失败 (${direction})`, error.message, true);
+        }
+      }
+
       createButton.addEventListener("click", handleCreate);
       checkHealthButton.addEventListener("click", handleHealthCheck);
       clearFileCacheButton.addEventListener("click", handleClearFileCache);
@@ -654,19 +857,94 @@
       reportButton.addEventListener("click", handleReport);
       deleteButton.addEventListener("click", handleDelete);
 
+      playerSeekButton.addEventListener("click", handlePlayerSeek);
+      prevSequenceButton.addEventListener("click", () => handleSequenceSeek('prev'));
+      nextSequenceButton.addEventListener("click", () => handleSequenceSeek('next'));
+
+      // 动态调整 seek 时间 - 12的倍数减2的序列
+      function adjustSeekTime(direction) {
+        const currentValue = parseFloat(playerSeekInput.value) || 0;
+        let newValue;
+
+        if (direction === "up") {
+          // 向上：找到下一个 12n-2 的值
+          const nextMultiple = Math.floor((currentValue + 2) / 12) + 1;
+          newValue = nextMultiple * 12 - 2;
+        } else {
+          // 向下：找到上一个 12n-2 的值
+          const prevMultiple = Math.ceil((currentValue + 2) / 12) - 1;
+          newValue = Math.max(0, prevMultiple * 12 - 2);
+        }
+
+        playerSeekInput.value = newValue;
+        return newValue;
+      }
+
+      // 拦截键盘上下箭头
+      playerSeekInput.addEventListener("keydown", function(event) {
+        if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+          event.preventDefault();
+          adjustSeekTime(event.key === "ArrowUp" ? "up" : "down");
+        }
+      });
+
+      // 拦截鼠标滚轮
+      playerSeekInput.addEventListener("wheel", function(event) {
+        event.preventDefault();
+        adjustSeekTime(event.deltaY < 0 ? "up" : "down");
+      });
+
+      // 拦截输入框的增减按钮点击（通过监听值变化）
+      let lastValue = playerSeekInput.value;
+      playerSeekInput.addEventListener("input", function(event) {
+        const currentValue = parseFloat(this.value) || 0;
+        const lastVal = parseFloat(lastValue) || 0;
+
+        // 如果值变化了1或-1，说明可能是点击了增减按钮
+        if (Math.abs(currentValue - lastVal) === 1) {
+          const direction = currentValue > lastVal ? "up" : "down";
+          adjustSeekTime(direction);
+        }
+
+        lastValue = this.value;
+      });
+
       defaultFileInput.addEventListener("change", () => {
         const filePath = defaultFileInput.value.trim();
         filePathInput.value = filePath;
         cacheFilePathInput.value = filePath;
+
+        // Save to localStorage
+        if (filePath) {
+          saveToStorage(STORAGE_KEYS.DEFAULT_FILE, filePath);
+          saveFileHistory(filePath);
+          updateFileHistoryDropdown();
+        }
+      });
+
+      // Save API base when it changes
+      apiBaseInput.addEventListener("change", () => {
+        const apiBase = apiBaseInput.value.trim();
+        if (apiBase) {
+          saveToStorage(STORAGE_KEYS.API_BASE, apiBase);
+        }
       });
 
       document.addEventListener("DOMContentLoaded", () => {
-        apiBaseInput.value = defaultApiBase();
-        const defaultFile = defaultFileInput.value.trim();
-        if (defaultFile) {
-          filePathInput.value = defaultFile;
-          cacheFilePathInput.value = defaultFile;
+        // Load saved API base or use default
+        const savedApiBase = getFromStorage(STORAGE_KEYS.API_BASE);
+        apiBaseInput.value = savedApiBase || defaultApiBase();
+
+        // Load saved default file path
+        const savedDefaultFile = getFromStorage(STORAGE_KEYS.DEFAULT_FILE);
+        if (savedDefaultFile) {
+          defaultFileInput.value = savedDefaultFile;
+          filePathInput.value = savedDefaultFile;
+          cacheFilePathInput.value = savedDefaultFile;
         }
+
+        // Update file history dropdown
+        updateFileHistoryDropdown();
       });
     </script>
   </body>

@@ -4,6 +4,7 @@
 """
 
 import logging
+import time
 
 import aiofiles
 
@@ -14,6 +15,7 @@ from app.models.session import (
     SessionPlaylist,
     WindowReference,
 )
+from app.services.audio_preprocessor import AudioPreprocessor
 from app.services.jit_transcoder import JITTranscoder
 from app.utils.hash import get_cache_path
 
@@ -23,8 +25,13 @@ logger = logging.getLogger(__name__)
 class SessionPlaylistGenerator:
     """会话级播放列表生成器"""
 
-    def __init__(self, jit_transcoder: JITTranscoder):
+    def __init__(
+        self,
+        jit_transcoder: JITTranscoder,
+        audio_preprocessor: AudioPreprocessor | None = None,
+    ):
         self.jit_transcoder = jit_transcoder
+        self.audio_preprocessor = audio_preprocessor
 
     async def generate_playlist(self, session: PlaybackSession) -> SessionPlaylist:
         """
@@ -47,6 +54,8 @@ class SessionPlaylistGenerator:
             target_duration=session.profile.hls_time,
             version=6,
             is_live=False,
+            has_audio_track=session.hybrid_mode and session.is_audio_ready(),
+            audio_track_id=session.audio_track_id if session.hybrid_mode else None,
         )
 
         # 获取排序后的窗口
@@ -55,8 +64,14 @@ class SessionPlaylistGenerator:
             logger.warning(f"会话 {session.session_id} 没有可用的窗口")
             return playlist
 
-        # 生成播放列表片段（基于预计算）
-        segments = await self._generate_precomputed_segments(session)
+        # 根据会话模式生成播放列表片段
+        if session.hybrid_mode:
+            # 混合模式：结合视频窗口和音频轨道
+            segments = await self._generate_hybrid_segments(session)
+        else:
+            # 传统模式：基于预计算生成
+            segments = await self._generate_precomputed_segments(session)
+
         playlist.segments = segments
 
         # 更新会话播放列表
@@ -87,6 +102,7 @@ class SessionPlaylistGenerator:
     ) -> list[PlaylistSegment]:
         """基于预计算生成播放列表片段"""
         segments: list[PlaylistSegment] = []
+        current_time = int(time.time())
 
         # 如果没有视频时长，无法生成完整播放列表
         if session.duration is None:
@@ -103,14 +119,16 @@ class SessionPlaylistGenerator:
         prev_window_id = None
 
         for precomp_segment in precomputed_segments:
-            # 检查是否需要不连续标记（窗口边界）
+            # 检查是否需要不连续标记（只有非相邻窗口才需要）
             needs_discontinuity = (
                 prev_window_id is not None
                 and precomp_segment.window_id != prev_window_id
+                and precomp_segment.window_id
+                != prev_window_id + 1  # 相邻窗口不需要DISCONTINUITY
             )
 
             # 生成完整的分片URL
-            segment_url = f"/api/v1/jit/hls/{session.asset_hash}/{session.profile_hash}/{precomp_segment.window_id:06d}/{precomp_segment.url}"
+            segment_url = f"/api/v1/jit/hls/{session.asset_hash}/{session.profile_hash}/{precomp_segment.window_id:06d}/{precomp_segment.url}?ts={current_time}"
 
             # 检查分片是否可用（所属窗口是否已转码）
             is_available = precomp_segment.window_id in session.loaded_windows
@@ -284,7 +302,10 @@ class SessionPlaylistGenerator:
     def _needs_discontinuity_marker(
         self, window_index: int, windows: list[WindowReference]
     ) -> bool:
-        """检查是否需要不连续标记"""
+        """检查是否需要不连续标记
+
+        关键修复：相邻窗口不需要DISCONTINUITY标记，只有在窗口不连续时才需要
+        """
         # 第一个窗口不需要不连续标记
         if window_index == 0:
             return False
@@ -292,10 +313,19 @@ class SessionPlaylistGenerator:
         current_window = windows[window_index]
         previous_window = windows[window_index - 1]
 
-        # 对于JIT转码，不同窗口间通常需要不连续标记
-        # 因为每个窗口是独立转码进程的产出，PTS/时间基可能不连续
-        if current_window.window_id != previous_window.window_id:
-            logger.debug(f"窗口 {current_window.window_id} 需要不连续标记 (窗口边界)")
+        # 相邻窗口（window_id 连续）不需要DISCONTINUITY标记
+        # 这是关键修复：让HLS播放器认为相邻窗口的媒体是连续的
+        if current_window.window_id == previous_window.window_id + 1:
+            logger.debug(
+                f"窗口 {current_window.window_id} 是相邻窗口，不需要不连续标记"
+            )
+            return False
+
+        # 只有在窗口ID不连续时才需要DISCONTINUITY标记
+        if current_window.window_id != previous_window.window_id + 1:
+            logger.debug(
+                f"窗口 {current_window.window_id} 不连续 (从 {previous_window.window_id} 跳跃)，需要不连续标记"
+            )
             return True
 
         # 检查时间是否连续
@@ -418,3 +448,105 @@ class SessionPlaylistGenerator:
                 return False
 
         return True
+
+    async def _generate_hybrid_segments(
+        self, session: PlaybackSession
+    ) -> list[PlaylistSegment]:
+        """
+        生成混合模式播放列表片段
+        结合视频窗口（仅视频）和独立音频轨道
+        """
+        if not self.audio_preprocessor:
+            logger.warning("混合模式需要音频预处理器，回退到传统模式")
+            return await self._generate_precomputed_segments(session)
+
+        if not session.is_audio_ready():
+            logger.warning(
+                f"会话 {session.session_id} 音频轨道未就绪，等待音频处理完成"
+            )
+            # 可以返回空列表或者部分视频片段
+            return []
+
+        segments: list[PlaylistSegment] = []
+        current_time = int(time.time())
+
+        # 如果没有视频时长，无法生成完整播放列表
+        if session.duration is None:
+            logger.warning(
+                f"会话 {session.session_id} 缺少视频时长信息，无法生成混合播放列表"
+            )
+            return []
+
+        # 预计算所有分片，基于视频窗口结构
+        precomputed_segments = self._precompute_all_segments(session)
+
+        sequence_number = 0
+        prev_window_id = None
+
+        for precomp_segment in precomputed_segments:
+            # 检查是否需要不连续标记（相邻窗口不需要）
+            needs_discontinuity = (
+                prev_window_id is not None
+                and precomp_segment.window_id != prev_window_id
+                and precomp_segment.window_id != prev_window_id + 1
+            )
+
+            # 混合模式：视频使用窗口转码，音频使用独立轨道
+            # 这里生成的是视频片段URL，音频会通过单独的轨道处理
+            video_segment_url = f"/api/v1/jit/hls/{session.asset_hash}/{session.profile_hash}/{precomp_segment.window_id:06d}/{precomp_segment.url}?ts={current_time}"
+
+            # 在混合模式下，我们需要生成包含音频信息的特殊播放列表
+            # 这可能需要生成多轨道的HLS或者使用分离的音频轨道
+            # 目前先使用视频片段，音频轨道将通过其他方式处理
+
+            # 检查视频片段是否可用
+            is_available = precomp_segment.window_id in session.loaded_windows
+
+            segment = PlaylistSegment(
+                url=video_segment_url,
+                duration=precomp_segment.duration,
+                sequence_number=sequence_number,
+                window_id=precomp_segment.window_id,
+                discontinuity_before=needs_discontinuity,
+                available=is_available,
+            )
+
+            segments.append(segment)
+            sequence_number += 1
+            prev_window_id = precomp_segment.window_id
+
+        logger.info(
+            f"会话 {session.session_id} 混合模式生成 {len(segments)} 个视频片段，"
+            f"可用片段: {sum(1 for s in segments if s.available)}"
+        )
+
+        return segments
+
+    # async def _ensure_audio_track_for_session(self, session: PlaybackSession) -> bool:
+    #     """
+    #     确保会话的音频轨道已准备就绪
+    #     """
+    #     if not session.hybrid_mode or not self.audio_preprocessor:
+    #         return True
+
+    #     if session.audio_track_ready:
+    #         return True
+
+    #     try:
+    #         # 启动音频轨道处理
+    #         audio_track_id = await self.audio_preprocessor.ensure_audio_track(
+    #             session.file_path, session.audio_profile
+    #         )
+
+    #         if audio_track_id:
+    #             session.enable_hybrid_mode(audio_track_id)
+    #             session.set_audio_track_ready(True)
+    #             logger.info(
+    #                 f"会话 {session.session_id} 音频轨道已准备: {audio_track_id}"
+    #             )
+    #             return True
+
+    #     except Exception as e:
+    #         logger.error(f"音频轨道处理失败: {e}")
+
+    #     return False

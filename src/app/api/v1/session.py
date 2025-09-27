@@ -11,7 +11,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
 
 from app.api.deps import get_session_manager
-from app.models.window import TranscodeProfile
 from app.schemas.session_request import (
     SessionCreateRequest,
     SessionCreateResponse,
@@ -52,22 +51,13 @@ async def create_session(
                 status_code=404, detail=f"文件不存在: {request.file_path}"
             )
 
-        # 构建转码配置
-        profile = TranscodeProfile()
-        if request.video_codec:
-            profile.video_codec = request.video_codec
-        if request.video_preset:
-            profile.video_preset = request.video_preset
-        if request.video_bitrate:
-            profile.video_bitrate = request.video_bitrate
-        if request.hls_time:
-            profile.hls_time = request.hls_time
-        if request.window_duration:
-            profile.window_duration = request.window_duration
-
-        # 创建会话
+        # 创建会话（使用新的接口）
         session = await session_manager.create_session(
-            file_path, profile, request.initial_time
+            file_path=file_path,
+            quality=request.quality,
+            initial_time=request.initial_time,
+            enable_hybrid=request.enable_hybrid,
+            video_only=request.video_only,
         )
 
         # 生成播放列表URL
@@ -100,6 +90,7 @@ async def get_session_playlist(
     - 返回m3u8格式的播放列表
     - 包含跨窗口的连续片段
     - 在窗口边界自动插入EXT-X-DISCONTINUITY标记
+    - 混合模式下返回主播放列表(Master Playlist)
     """
     try:
         playlist_content = await session_manager.get_session_playlist(session_id)
@@ -122,6 +113,46 @@ async def get_session_playlist(
     except Exception as e:
         logger.error(f"获取会话播放列表失败: {e}")
         raise HTTPException(status_code=500, detail=f"播放列表错误: {str(e)}")
+
+
+@router.get("/{session_id}/video.m3u8")
+async def get_session_video_playlist(
+    session_id: str,
+    session_manager: SessionManager = Depends(get_session_manager),
+):
+    """
+    获取会话的视频轨道播放列表
+
+    - 专用于混合模式的视频轨道
+    - 只包含视频片段（无音频）
+    - 与独立音频轨道配合使用
+    """
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        # 生成视频专用播放列表
+        playlist_content = await session_manager.get_session_video_playlist(session_id)
+        if not playlist_content:
+            raise HTTPException(status_code=404, detail="视频播放列表无效")
+
+        return Response(
+            content=playlist_content,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取视频播放列表失败: {e}")
+        raise HTTPException(status_code=500, detail=f"视频播放列表错误: {str(e)}")
 
 
 @router.get("/{session_id}/info", response_model=SessionInfoResponse)

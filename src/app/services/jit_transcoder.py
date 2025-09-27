@@ -11,13 +11,13 @@ from pathlib import Path
 
 import aiofiles
 
+from app.config import ConfigManager
 from app.models.window import (
     CacheStats,
     TranscodeProfile,
     TranscodeWindow,
     WindowCache,
 )
-from app.settings import settings
 from app.utils.hash import (
     calculate_asset_hash,
     calculate_profile_hash,
@@ -32,7 +32,7 @@ class JITTranscoder:
     """JIT 转码器"""
 
     _instance = None
-    _initilized = False
+    _initialized = False
 
     def __new__(cls, *args, **kwargs):  # noqa: ARG004
         if cls._instance is None:
@@ -40,9 +40,10 @@ class JITTranscoder:
         return cls._instance
 
     def __init__(self, cache_root: str | None = None, max_concurrent: int = 3):
-        if self._initilized:
+        if self._initialized:
             return
-        self.cache_root = Path(cache_root or settings.v1_CACHE_ROOT)
+        self.config = ConfigManager()
+        self.cache_root = Path(cache_root or self.config.app_settings.v1_cache_root)
         self.max_concurrent = max_concurrent
 
         # 运行中的任务
@@ -58,7 +59,7 @@ class JITTranscoder:
 
         logger.info(f"JIT 转码器初始化完成，缓存目录: {self.cache_root}")
 
-        self._initilized = True
+        self._initialized = True
 
     async def ensure_window(
         self,
@@ -214,6 +215,10 @@ class JITTranscoder:
         async with self.task_semaphore:  # 控制并发数
             try:
                 await self._execute_ffmpeg(window, profile)
+            except asyncio.CancelledError:
+                # 应用关闭时忽略取消错误
+                logger.debug(f"窗口 {window.window_id} 转码被取消（应用关闭）")
+                raise
             except Exception as e:
                 window.fail_transcoding(str(e))
                 raise
@@ -224,8 +229,11 @@ class JITTranscoder:
         """执行 FFmpeg 转码"""
         window.start_transcoding()
 
+        # 获取视频信息用于动态GOP计算
+        video_info = await self._get_video_info(window.input_file)
+
         # 构建 FFmpeg 命令
-        cmd_args = self._build_ffmpeg_command(window, profile)
+        cmd_args = await self._build_ffmpeg_command(window, profile, video_info)
         logger.info(f"执行 FFmpeg 命令: {' '.join(cmd_args)}")
         logger.debug(f"命令参数详情: {cmd_args}")
 
@@ -263,38 +271,45 @@ class JITTranscoder:
                 raise RuntimeError(error_msg)
 
         except asyncio.CancelledError:
-            # 任务被取消
+            # 任务被取消（通常是应用关闭）
             if window.process:
-                window.process.kill()
+                try:
+                    # 优雅终止FFmpeg进程
+                    window.process.terminate()
+                    # 等待短时间让进程自行退出
+                    try:
+                        await asyncio.wait_for(window.process.wait(), timeout=2.0)
+                        logger.debug(f"窗口 {window.window_id} FFmpeg 进程已优雅退出")
+                    except TimeoutError:
+                        # 超时则强制终止
+                        window.process.kill()
+                        logger.debug(f"窗口 {window.window_id} FFmpeg 进程已强制终止")
+                except Exception as e:
+                    # 忽略关闭时的所有错误
+                    logger.debug(f"关闭 FFmpeg 进程时出现错误（已忽略）: {e}")
             raise
         except Exception as e:
             logger.error(f"FFmpeg 执行失败: {e}")
             raise
 
-    def _build_ffmpeg_command(
-        self, window: TranscodeWindow, profile: TranscodeProfile
+    async def _build_ffmpeg_command(
+        self, window: TranscodeWindow, profile: TranscodeProfile, video_info: dict
     ) -> list[str]:
         """构建 FFmpeg 命令行
 
-        基于最佳实践重构，参考命令格式：
-        ffmpeg -hide_banner -y -ss 0 -t 30 -i "/path/to/input.mkv" \
-        -map 0:v:0 -map 0:a:0 \
-        -c:v libx264 -preset veryfast -pix_fmt yuv420p \
-        -g 48 -keyint_min 48 -sc_threshold 0 \
-        -c:a aac -profile:a aac_low -ar 48000 -ac 2 -b:a 192k \
-        -fflags +genpts -avoid_negative_ts make_zero \
-        -af "aresample=async=1:first_pts=0" \
-        -f hls -hls_time 4 -hls_list_size 0 \
-        -hls_segment_type fmp4 \
-        -hls_fmp4_init_filename "init.mp4" \
-        -hls_segment_filename "seg_%05d.m4s" \
-        "index.m3u8"
+        支持混合转码模式：
+        - 传统模式：音视频一起转码（原有逻辑）
+        - 混合模式：只转码视频，音频由AudioPreprocessor单独处理
         """
         input_file = str(window.input_file)
         output_dir = str(window.output_dir)
 
-        return [
-            settings.FFMPEG_EXECUTABLE,
+        # 动态计算GOP设置
+        fps = video_info.get("fps", 23.9)
+        gop_size, keyint_min = self._calculate_gop_settings(fps, profile.hls_time)
+
+        cmd_args = [
+            self.config.app_settings.ffmpeg_path,
             "-hide_banner",  # 隐藏版本信息横幅
             "-y",  # 覆盖输出文件
             "-ss",
@@ -303,53 +318,110 @@ class JITTranscoder:
             str(window.duration),  # 持续时间
             "-i",
             input_file,  # 输入文件
-            # 流映射 - 显式选择视频和音频流
-            "-map",
-            "0:v:0",  # 第一个视频流
-            "-map",
-            "0:a:0",  # 第一个音频流
-            # 视频编码设置
-            "-c:v",
-            profile.video_codec,
-            "-preset",
-            profile.video_preset,
-            "-pix_fmt",
-            profile.pixel_format,
-            "-g",
-            str(profile.gop_size),
-            "-keyint_min",
-            str(profile.keyint_min),
-            "-sc_threshold",
-            "0",  # 禁用场景变化检测
-            # 音频编码设置
-            "-c:a",
-            profile.audio_codec,
-            "-profile:a",
-            "aac_low",  # AAC低复杂度配置
-            "-ar",
-            "48000",  # 采样率
-            "-ac",
-            "2",  # 双声道
-            "-b:a",
-            profile.audio_bitrate,
-            "-output_ts_offset",
-            str(window.start_time),
-            # HLS 输出设置
-            "-f",
-            "hls",
-            "-hls_time",
-            str(profile.hls_time),
-            "-hls_list_size",
-            str(profile.hls_list_size),
-            "-hls_segment_type",
-            "fmp4",  # 使用 fMP4 分段格式
-            "-hls_fmp4_init_filename",
-            "init.mp4",  # 初始化文件名
-            "-hls_segment_filename",
-            f"{output_dir}/seg_%05d.m4s",  # 分段文件名
-            # 输出播放列表
-            f"{output_dir}/index.m3u8",
         ]
+
+        # 根据转码模式选择流映射
+        if profile.video_only or profile.hybrid_mode:
+            # 混合模式/纯视频模式：只映射视频流，禁用音频
+            cmd_args.extend(
+                [
+                    "-map",
+                    "0:v:0",  # 只选择视频流
+                    "-an",  # 禁用音频
+                ]
+            )
+        else:
+            # 传统模式：映射视频和音频流
+            cmd_args.extend(
+                [
+                    "-map",
+                    "0:v:0",  # 第一个视频流
+                    "-map",
+                    "0:a:0",  # 第一个音频流
+                ]
+            )
+
+        # 视频编码设置
+        cmd_args.extend(
+            [
+                "-c:v",
+                profile.video_codec,
+                "-preset",
+                profile.video_preset,
+                "-pix_fmt",
+                profile.pixel_format,
+                "-g",
+                str(gop_size),
+                "-keyint_min",
+                str(keyint_min),
+                "-sc_threshold",
+                "0",  # 禁用场景变化检测
+                "-force_key_frames",
+                "expr:gte(t,0)",  # 强制在开始时生成关键帧
+            ]
+        )
+
+        # 音频编码设置（仅在非纯视频模式下）
+        if not (profile.video_only or profile.hybrid_mode):
+            cmd_args.extend(
+                [
+                    "-c:a",
+                    profile.audio_codec,
+                    "-profile:a",
+                    "aac_low",  # AAC低复杂度配置
+                    "-ar",
+                    "48000",  # 采样率
+                    "-ac",
+                    "2",  # 双声道
+                    "-b:a",
+                    profile.audio_bitrate,
+                ]
+            )
+
+        # 时间戳处理
+        if profile.hybrid_mode:
+            # 混合模式：使用绝对时间戳，便于与独立音轨同步
+            cmd_args.extend(
+                [
+                    "-copyts",
+                    "-start_at_zero",
+                    "-avoid_negative_ts",
+                    "disabled",
+                ]
+            )
+        else:
+            # 传统模式：保持原有时间戳处理
+            cmd_args.extend(
+                [
+                    "-copyts",
+                    "-start_at_zero",
+                    "-avoid_negative_ts",
+                    "disabled",
+                ]
+            )
+
+        # HLS 输出设置
+        cmd_args.extend(
+            [
+                "-f",
+                "hls",
+                "-hls_time",
+                str(profile.hls_time),
+                "-hls_list_size",
+                str(profile.hls_list_size),
+                "-hls_segment_type",
+                "fmp4",  # 使用 fMP4 分段格式
+                "-hls_fmp4_init_filename",
+                "init.mp4",  # 初始化文件名
+                "-hls_segment_filename",
+                f"{output_dir}/seg_%05d.m4s",  # 分段文件名
+                # 输出播放列表
+                f"{output_dir}/index.m3u8",
+            ]
+        )
+
+        # 清理空字符串参数
+        return [arg for arg in cmd_args if arg]
 
     async def _ensure_cache_loaded(self) -> None:
         """确保缓存索引已加载"""
@@ -681,8 +753,6 @@ class JITTranscoder:
 
         return sorted(existing_windows)
 
-
-
     def shutdown(self) -> None:
         """关闭转码器"""
         logger.info("JIT 转码器正在关闭...")
@@ -693,3 +763,81 @@ class JITTranscoder:
 
         self.running_windows.clear()
         logger.info("JIT 转码器已关闭")
+
+    async def _get_video_info(self, input_file: Path) -> dict:
+        """获取视频信息，特别是帧率"""
+        try:
+            cmd_args = [
+                self.config.app_settings.ffprobe_path,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-select_streams",
+                "v:0",
+                str(input_file),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, stderr = await process.communicate()
+
+            if process.returncode == 0 and stdout:
+                info = json.loads(stdout.decode())
+                if info.get("streams"):
+                    stream = info["streams"][0]
+                    # 解析帧率
+                    fps_str = stream.get("r_frame_rate", "25/1")
+                    if "/" in fps_str:
+                        num, den = fps_str.split("/")
+                        fps = float(num) / float(den) if float(den) != 0 else 25.0
+                    else:
+                        fps = float(fps_str)
+
+                    return {
+                        "fps": fps,
+                        "duration": float(stream.get("duration", 0)),
+                        "width": int(stream.get("width", 0)),
+                        "height": int(stream.get("height", 0)),
+                    }
+
+            logger.warning(
+                f"无法获取视频信息: {stderr.decode() if stderr else 'Unknown error'}"
+            )
+
+        except Exception as e:
+            logger.error(f"获取视频信息失败: {e}")
+
+        # 返回默认值
+        return {"fps": 25.0, "duration": 0, "width": 0, "height": 0}
+
+    def _calculate_gop_settings(self, fps: float, hls_time: float) -> tuple[int, int]:
+        """
+        根据帧率和segment时长动态计算GOP设置
+
+        Args:
+            fps: 视频帧率
+            hls_time: HLS segment时长（秒）
+
+        Returns:
+            tuple: (gop_size, keyint_min)
+        """
+        # 计算每个segment的帧数，确保GOP边界与segment边界对齐
+        frames_per_segment = int(fps * hls_time)
+
+        # GOP大小设为segment帧数，确保每个segment开始时都有关键帧
+        gop_size = frames_per_segment
+
+        # 最小关键帧间隔设为相同值，确保固定间隔
+        keyint_min = gop_size
+
+        logger.debug(
+            f"动态GOP设置: fps={fps:.2f}, hls_time={hls_time}s, gop_size={gop_size}, keyint_min={keyint_min}"
+        )
+
+        return gop_size, keyint_min
