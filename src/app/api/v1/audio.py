@@ -76,55 +76,54 @@ async def get_audio_playlist(
         raise HTTPException(status_code=500, detail="获取音频播放列表失败")
 
 
-@router.get("/{asset_hash}/{profile_hash}/audio_seg_{segment_index}.aac")
-async def get_audio_segment(
+@router.get("/{asset_hash}/{profile_hash}/{filename}.aac")
+async def get_audio_file(
     asset_hash: str,
     profile_hash: str,
-    segment_index: int,
+    filename: str,
 ) -> FileResponse:
     """
-    获取音频分片文件
+    获取音频文件（统一返回完整音频文件）
 
     Args:
         asset_hash: 资产哈希
         profile_hash: 配置哈希
-        segment_index: 分片索引
-        audio_preprocessor: 音频预处理器
+        filename: 请求的文件名（忽略，统一返回完整音频）
 
     Returns:
-        FileResponse: 音频分片文件
+        FileResponse: 完整的音频文件
     """
     if not config_manager.transcode.enable_hybrid_mode:
         raise HTTPException(status_code=400, detail="混合模式未启用")
 
     try:
-        # 构建分片文件路径
+        # 构建完整音频文件路径，忽略请求的filename
         cache_config = config_manager.cache
         audio_cache_root = Path(cache_config.audio_cache_root)
-        segment_filename = cache_config.audio_segment_pattern.format(
-            index=segment_index
+        complete_audio_file = (
+            audio_cache_root
+            / asset_hash
+            / profile_hash
+            / cache_config.audio_track_filename
         )
-        segment_file = audio_cache_root / asset_hash / profile_hash / segment_filename
 
-        if not segment_file.exists():
-            raise HTTPException(
-                status_code=404, detail=f"音频分片不存在: segment_{segment_index:05d}"
-            )
+        if not complete_audio_file.exists():
+            raise HTTPException(status_code=404, detail="音频文件不存在")
 
-        # 返回音频文件
+        # 返回完整音频文件
         http_config = config_manager.http
         return FileResponse(
-            path=segment_file,
+            path=complete_audio_file,
             media_type=http_config.media_types["aac"],
             headers={
                 **http_config.static_cache_headers,
-                "Content-Disposition": f"inline; filename={segment_filename}",
+                "Content-Disposition": f"inline; filename={filename}.aac",
             },
         )
 
     except Exception as e:
-        logger.error(f"获取音频分片失败: {e}")
-        raise HTTPException(status_code=500, detail="获取音频分片失败")
+        logger.error(f"获取音频文件失败: {e}")
+        raise HTTPException(status_code=500, detail="获取音频文件失败")
 
 
 @router.get("/{asset_hash}/{profile_hash}/stats")
@@ -161,7 +160,6 @@ async def get_audio_track_stats(
             "asset_hash": asset_hash,
             "profile_hash": profile_hash,
             "duration": cache.duration,
-            "segment_count": cache.segment_count,
             "total_size_bytes": cache.total_size,
             "hit_count": cache.hit_count,
             "created_at": cache.created_at,
@@ -199,7 +197,6 @@ async def get_audio_global_stats(
         return {
             "total_tracks": stats.total_tracks,
             "total_size_bytes": stats.total_size_bytes,
-            "total_segments": stats.total_segments,
             "total_hit_count": stats.total_hit_count,
             "avg_track_size": stats.avg_track_size,
             "cache_hit_rate": stats.cache_hit_rate,

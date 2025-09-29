@@ -170,7 +170,6 @@ class AudioPreprocessor:
                     profile_hash=profile_hash,
                     track_dir=output_dir,
                     duration=duration,
-                    segment_count=track.segment_count,
                     total_size=track.total_size,
                 )
                 self.track_cache[cache_key] = cache
@@ -185,7 +184,7 @@ class AudioPreprocessor:
                 del self.running_tracks[cache_key]
 
     async def _process_audio_track(self, track: AudioTrack) -> None:
-        """处理音频轨道"""
+        """处理音频轨道（仅转码，不分片）"""
         async with self.task_semaphore:  # 控制并发数
             try:
                 track.start_processing()
@@ -193,19 +192,12 @@ class AudioPreprocessor:
                 # 第一步：提取完整音频轨道
                 await self._extract_audio_track(track)
 
-                # 第二步：生成音频分片
-                await self._generate_audio_segments(track)
-
-                # 第三步：验证分片完整性
-                if not track.validate_segments():
-                    raise RuntimeError("音频分片验证失败")
-
-                # 第四步：保存元数据
+                # 第二步：保存元数据
                 await self._save_track_metadata(track)
 
                 track.complete_processing()
                 logger.info(
-                    f"音频轨道处理完成: {track.asset_hash[:8]}, {track.segment_count} 个分片"
+                    f"音频轨道处理完成: {track.asset_hash[:8]}, 完整音频文件已生成"
                 )
 
             except Exception as e:
@@ -238,7 +230,7 @@ class AudioPreprocessor:
             "-b:a",
             profile.bitrate,  # 音频码率
             "-avoid_negative_ts",
-            "make_zero",  # 避免负时间戳
+            "disabled",  # 保持原始时间戳
             output_file,  # 输出文件
         ]
 
@@ -274,95 +266,7 @@ class AudioPreprocessor:
             logger.error(f"音频轨道提取失败: {e}")
             raise
 
-    async def _generate_audio_segments(self, track: AudioTrack) -> None:
-        """生成音频分片"""
-        profile = track.profile
-        segment_duration = profile.segment_duration
-        total_duration = track.duration
 
-        # 计算分片数量
-        segment_count = int((total_duration + segment_duration - 1) // segment_duration)
-
-        logger.info(f"生成 {segment_count} 个音频分片，每个 {segment_duration}s")
-
-        for i in range(segment_count):
-            start_time = i * segment_duration
-            duration = min(segment_duration, total_duration - start_time)
-
-            if duration <= 0:
-                break
-
-            # 分片文件路径
-            segment_file = track.output_dir / f"audio_seg_{i:05d}.aac"
-
-            # 使用 FFmpeg 切割音频分片
-            await self._extract_audio_segment(
-                track.track_file_path,
-                segment_file,
-                start_time,
-                duration,
-            )
-
-            # 创建分片对象
-            if segment_file.exists():
-                segment = AudioSegment(
-                    segment_index=i,
-                    start_time=start_time,
-                    duration=duration,
-                    file_path=segment_file,
-                    file_size=segment_file.stat().st_size,
-                )
-                track.add_segment(segment)
-            else:
-                raise RuntimeError(f"音频分片生成失败: {segment_file}")
-
-        logger.info(f"音频分片生成完成: {len(track.segments)} 个分片")
-
-    async def _extract_audio_segment(
-        self,
-        input_file: Path,
-        output_file: Path,
-        start_time: float,
-        duration: float,
-    ) -> None:
-        """提取单个音频分片"""
-        cmd_args = [
-            self.config.app_settings.ffmpeg_path,
-            "-hide_banner",
-            "-y",  # 覆盖输出文件
-            "-ss",
-            str(start_time),  # 开始时间
-            "-t",
-            str(duration),  # 持续时间
-            "-i",
-            str(input_file),  # 输入文件
-            "-c",
-            "copy",  # 复制流，避免重编码
-            "-avoid_negative_ts",
-            "make_zero",  # 避免负时间戳
-            str(output_file),  # 输出文件
-        ]
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *cmd_args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                error_msg = (
-                    stderr.decode()
-                    if stderr
-                    else f"FFmpeg 返回代码: {process.returncode}"
-                )
-                raise RuntimeError(f"音频分片切割失败: {error_msg}")
-
-        except Exception as e:
-            logger.error(f"音频分片切割失败: {e}")
-            raise
 
     async def _get_video_info(self, input_file: Path) -> dict:
         """获取视频信息，特别是时长"""
@@ -480,7 +384,6 @@ class AudioPreprocessor:
         try:
             meta = {
                 "duration": cache.duration,
-                "segment_count": cache.segment_count,
                 "total_size": cache.total_size,
                 "hit_count": cache.hit_count,
                 "last_access": cache.last_access,
@@ -502,25 +405,12 @@ class AudioPreprocessor:
         meta_file = track.metadata_file_path
 
         try:
-            segments_data = [
-                {
-                    "segment_index": seg.segment_index,
-                    "start_time": seg.start_time,
-                    "duration": seg.duration,
-                    "url": seg.url,
-                    "file_size": seg.file_size,
-                }
-                for seg in track.segments
-            ]
-
             meta = {
                 "asset_hash": track.asset_hash,
                 "profile_hash": track.profile_hash,
                 "duration": track.duration,
-                "segment_count": track.segment_count,
                 "total_size": track.total_size,
                 "profile": track.profile.to_dict(),
-                "segments": segments_data,
                 "created_at": track.created_at,
                 "completed_at": track.completed_at,
             }
@@ -546,6 +436,7 @@ class AudioPreprocessor:
             logger.warning(f"计算目录大小失败 {directory}: {e}")
         return total_size
 
+
     async def get_track_stats(self) -> AudioTrackStats:
         """获取音频轨道统计信息"""
         await self._ensure_cache_loaded()
@@ -556,7 +447,6 @@ class AudioPreprocessor:
         caches = list(self.track_cache.values())
         total_tracks = len(caches)
         total_size = sum(c.total_size for c in caches)
-        total_segments = sum(c.segment_count for c in caches)
         total_hits = sum(c.hit_count for c in caches)
         avg_size = total_size / total_tracks if total_tracks > 0 else 0
 
@@ -568,7 +458,6 @@ class AudioPreprocessor:
         return AudioTrackStats(
             total_tracks=total_tracks,
             total_size_bytes=total_size,
-            total_segments=total_segments,
             total_hit_count=total_hits,
             avg_track_size=avg_size,
             oldest_track_age=oldest_age,
@@ -605,17 +494,13 @@ class AudioPreprocessor:
 
         return removed_count
 
-    def get_audio_segment_url(
-        self, asset_hash: str, profile_hash: str, segment_index: int
-    ) -> str:
-        """获取音频分片URL"""
-        return f"/api/v1/audio/{asset_hash}/{profile_hash}/audio_seg_{segment_index:05d}.aac"
+
 
     async def get_audio_playlist(
         self, asset_hash: str, profile_hash: str
     ) -> str | None:
         """
-        生成音频轨道的HLS播放列表
+        生成音频轨道的HLS播放列表（单文件）
 
         Args:
             asset_hash: 资产哈希
@@ -643,36 +528,23 @@ class AudioPreprocessor:
             cache.update_access()
             await self._save_cache_metadata(cache)
 
-            # 音频分片时长（固定4秒，与视频HLS时长一致）
-            segment_duration = 4.0
+            # 生成包含单个完整音频文件的m3u8播放列表
+            audio_file_url = f"/api/v1/audio/{asset_hash}/{profile_hash}/audio.aac"
 
             # 生成m3u8播放列表
             lines = [
                 "#EXTM3U",
                 "#EXT-X-VERSION:6",
-                f"#EXT-X-TARGETDURATION:{int(segment_duration) + 1}",
+                f"#EXT-X-TARGETDURATION:{int(cache.duration) + 1}",
                 "#EXT-X-PLAYLIST-TYPE:VOD",
                 "#EXT-X-MEDIA-SEQUENCE:0",
+                f"#EXTINF:{cache.duration:.6f},",
+                audio_file_url,
+                "#EXT-X-ENDLIST"
             ]
 
-            # 添加音频分片
-            for i in range(cache.segment_count):
-                segment_url = self.get_audio_segment_url(asset_hash, profile_hash, i)
-
-                # 对于最后一个分片，可能时长不同
-                if i == cache.segment_count - 1:
-                    # 计算最后一个分片的实际时长
-                    last_duration = cache.duration - (i * segment_duration)
-                    duration = min(last_duration, segment_duration)
-                else:
-                    duration = segment_duration
-
-                lines.extend([f"#EXTINF:{duration:.6f},", segment_url])
-
-            lines.append("#EXT-X-ENDLIST")
-
             logger.debug(
-                f"生成音频播放列表: {cache.segment_count}个分片，总时长{cache.duration:.1f}s"
+                f"生成音频播放列表: 单个文件，总时长{cache.duration:.1f}s"
             )
             return "\n".join(lines)
 

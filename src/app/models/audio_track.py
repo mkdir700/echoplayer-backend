@@ -113,11 +113,7 @@ class AudioTrack(BaseModel):
     completed_at: float | None = Field(default=None, description="完成时间")
     error_message: str | None = Field(default=None, description="错误信息")
 
-    # 分片信息
-    segments: list[AudioSegment] = Field(
-        default_factory=list, description="音频分片列表"
-    )
-    segment_count: int = Field(default=0, ge=0, description="分片数量")
+    # 文件信息
     total_size: int = Field(default=0, ge=0, description="总文件大小（字节）")
 
     # 配置信息
@@ -175,54 +171,6 @@ class AudioTrack(BaseModel):
         self.completed_at = time.time()
         self.error_message = error
 
-    def add_segment(self, segment: AudioSegment) -> None:
-        """添加音频分片"""
-        self.segments.append(segment)
-        self.segment_count = len(self.segments)
-        if segment.file_size > 0:
-            self.total_size += segment.file_size
-
-    def get_segment_by_time(self, time_seconds: float) -> AudioSegment | None:
-        """根据时间获取对应的音频分片"""
-        for segment in self.segments:
-            if segment.start_time <= time_seconds < segment.end_time:
-                return segment
-        return None
-
-    def get_segments_in_range(
-        self, start_time: float, end_time: float
-    ) -> list[AudioSegment]:
-        """获取时间范围内的所有分片"""
-        segments = []
-        for segment in self.segments:
-            # 检查分片是否与时间范围有重叠
-            if segment.start_time < end_time and segment.end_time > start_time:
-                segments.append(segment)  # noqa: PERF401
-        return sorted(segments, key=lambda s: s.start_time)
-
-    def validate_segments(self) -> bool:
-        """验证分片完整性"""
-        if not self.segments:
-            return False
-
-        # 检查分片连续性
-        self.segments.sort(key=lambda s: s.start_time)
-
-        for i in range(len(self.segments)):
-            segment = self.segments[i]
-
-            # 检查文件是否存在
-            if not segment.exists():
-                return False
-
-            # 检查时间连续性（允许小误差）
-            if i > 0:
-                prev_segment = self.segments[i - 1]
-                time_gap = segment.start_time - prev_segment.end_time
-                if abs(time_gap) > 0.1:  # 允许100ms误差
-                    return False
-
-        return True
 
     def cleanup(self) -> None:
         """清理音频轨道文件"""
@@ -230,11 +178,6 @@ class AudioTrack(BaseModel):
             # 删除完整轨道文件
             if self.track_file_path.exists():
                 self.track_file_path.unlink()
-
-            # 删除分片文件
-            for segment in self.segments:
-                if segment.file_path.exists():
-                    segment.file_path.unlink()
 
             # 删除元数据文件
             if self.metadata_file_path.exists():
@@ -252,7 +195,6 @@ class AudioTrackCache(BaseModel):
     profile_hash: str = Field(description="配置哈希")
     track_dir: Path = Field(description="轨道目录")
     duration: float = Field(description="总时长")
-    segment_count: int = Field(ge=0, description="分片数量")
     total_size: int = Field(default=0, ge=0, description="总大小（字节）")
     created_at: float = Field(default_factory=time.time, description="创建时间")
     last_access: float = Field(default_factory=time.time, description="最后访问时间")
@@ -284,7 +226,6 @@ class AudioTrackStats(BaseModel):
 
     total_tracks: int = Field(default=0, ge=0, description="总轨道数")
     total_size_bytes: int = Field(default=0, ge=0, description="总大小（字节）")
-    total_segments: int = Field(default=0, ge=0, description="总分片数")
     total_hit_count: int = Field(default=0, ge=0, description="总命中次数")
     avg_track_size: float = Field(default=0.0, ge=0, description="平均轨道大小")
     cache_hit_rate: float = Field(default=0.0, ge=0, le=1, description="缓存命中率")
