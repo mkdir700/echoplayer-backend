@@ -43,7 +43,7 @@ class JITTranscoder:
         if self._initialized:
             return
         self.config = ConfigManager()
-        self.cache_root = Path(cache_root or self.config.app_settings.v1_cache_root)
+        self.cache_root = Path(cache_root or self.config.app_settings.hls_segment_cache_root)
         self.max_concurrent = max_concurrent
 
         # 运行中的任务

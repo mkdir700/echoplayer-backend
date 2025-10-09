@@ -100,7 +100,7 @@ class CacheConfig(BaseModel):
 
     # 路径配置
     sessions_root: str = Field(default="", description="会话缓存根目录")
-    v1_cache_root: str = Field(default="", description="v1 HLS缓存根目录")
+    hls_segment_cache_root: str = Field(default="", description="HLS 分片缓存根目录")
     audio_cache_root: str = Field(default="", description="音频轨道缓存根目录")
 
     # 文件命名模式

@@ -47,11 +47,11 @@ class AppSettings(BaseSettings):
         ),
         description="会话缓存根目录",
     )
-    v1_cache_root: str = Field(
+    hls_segment_cache_root: str = Field(
         default_factory=lambda: str(
-            Path(__file__).parent.parent.parent.parent / "cache" / "v1_hls"
+            Path(__file__).parent.parent.parent.parent / "cache" / "hls_segments"
         ),
-        description="v1 HLS缓存根目录",
+        description="HLS 分片缓存根目录",
     )
     audio_cache_root: str = Field(
         default_factory=lambda: str(
@@ -90,7 +90,7 @@ class AppSettings(BaseSettings):
         default=48, gt=0, description="音频轨道TTL（小时）"
     )
 
-    @field_validator("sessions_root", "v1_cache_root", "audio_cache_root")
+    @field_validator("sessions_root", "hls_segment_cache_root", "audio_cache_root")
     @classmethod
     def validate_paths(cls, v: str) -> str:
         """验证路径配置"""
@@ -175,7 +175,7 @@ class ConfigManager:
         """从主配置创建缓存配置"""
         return CacheConfig(
             sessions_root=self.app_settings.sessions_root,
-            v1_cache_root=self.app_settings.v1_cache_root,
+            hls_segment_cache_root=self.app_settings.hls_segment_cache_root,
             audio_cache_root=self.app_settings.audio_cache_root,
             session_ttl=self.app_settings.session_ttl,
             audio_track_ttl_hours=self.app_settings.audio_track_ttl_hours,
