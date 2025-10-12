@@ -66,7 +66,7 @@ class SessionManager:
         video_only: bool = False,
     ) -> PlaybackSession:
         """
-        创建新的播放会话
+        创建新的播放会话（立即返回，后台异步处理）
 
         Args:
             file_path: 视频文件路径
@@ -76,16 +76,17 @@ class SessionManager:
             video_only: 是否只转码视频
 
         Returns:
-            PlaybackSession: 创建的会话
+            PlaybackSession: 创建的会话（状态为CREATING）
         """
-        # 使用SessionFactory创建会话，确保配置一致性
-        session = await self.session_factory.create_session(
+        # 先创建一个占位会话，立即返回
+        from app.models.session import PlaybackSession, SessionStatus
+
+        session = PlaybackSession(
             file_path=file_path,
-            quality=quality,
-            initial_time=initial_time,
-            enable_hybrid=enable_hybrid,
-            video_only=video_only,
+            status=SessionStatus.CREATING,
+            current_time=initial_time,
         )
+        session.update_progress(0.0, "初始化会话")
 
         # 存储会话
         self.sessions[session.session_id] = session
@@ -96,16 +97,108 @@ class SessionManager:
             self.sessions_by_file[file_key] = set()
         self.sessions_by_file[file_key].add(session.session_id)
 
-        logger.info(f"创建会话 {session.session_id}: {file_path} @ {initial_time}s")
+        logger.info(f"开始创建会话 {session.session_id}: {file_path} @ {initial_time}s")
 
-        # 预加载初始窗口
-        await self._preload_initial_windows(session)
+        # 启动后台任务进行实际的创建工作
+        asyncio.create_task(
+            self._create_session_background(
+                session.session_id,
+                file_path,
+                quality,
+                initial_time,
+                enable_hybrid,
+                video_only,
+            )
+        )
 
         # 启动清理任务（如果还未启动）
         if self.cleanup_task is None:
             self.cleanup_task = asyncio.create_task(self._cleanup_loop())
 
         return session
+
+    async def _create_session_background(
+        self,
+        session_id: str,
+        file_path: Path,
+        quality: str,
+        initial_time: float,
+        enable_hybrid: bool | None,
+        video_only: bool,
+    ) -> None:
+        """
+        后台异步创建会话
+
+        Args:
+            session_id: 会话ID
+            file_path: 文件路径
+            quality: 质量档位
+            initial_time: 初始时间
+            enable_hybrid: 是否启用混合模式
+            video_only: 是否只转码视频
+        """
+        from app.models.session import SessionStatus
+
+        session = self.sessions.get(session_id)
+        if not session:
+            logger.error(f"会话 {session_id} 不存在，无法完成后台创建")
+            return
+
+        try:
+            # 阶段1: 使用SessionFactory创建配置（10%）
+            session.update_progress(5.0, "正在分析视频文件", SessionStatus.CREATING)
+
+            # 定义进度回调函数
+            async def on_progress(percent: float, stage: str):
+                session.update_progress(percent, stage, SessionStatus.PREPROCESSING)
+
+            created_session = await self.session_factory.create_session(
+                file_path=file_path,
+                quality=quality,
+                initial_time=initial_time,
+                enable_hybrid=enable_hybrid,
+                video_only=video_only,
+                progress_callback=on_progress,
+            )
+
+            # 阶段2: 更新会话配置
+            # 如果音频已预处理，进度应该在30%左右（由回调更新）
+            # 如果没有启用混合模式，手动设置为20%
+            if not created_session.hybrid_mode:
+                session.update_progress(20.0, "正在生成转码配置")
+
+            session.asset_hash = created_session.asset_hash
+            session.profile = created_session.profile
+            session.profile_hash = created_session.profile_hash
+            session.duration = created_session.duration
+
+            # 如果启用了混合模式，复制音频配置
+            if created_session.hybrid_mode:
+                # 音频预处理完成，进度应该在85%左右
+                session.update_progress(
+                    85.0, "音频预处理完成", SessionStatus.PREPROCESSING
+                )
+                session.hybrid_mode = True
+                session.audio_track_id = created_session.audio_track_id
+                session.audio_profile = created_session.audio_profile
+                session.audio_track_ready = created_session.audio_track_ready
+
+            # 阶段3: 预加载初始窗口（85%-90%）
+            session.update_progress(85.0, "正在转码初始窗口", SessionStatus.TRANSCODING)
+            await self._preload_initial_windows(session)
+
+            # 阶段4: 完成初始化（90%-100%）
+            session.update_progress(
+                90.0, "正在生成播放列表", SessionStatus.INITIALIZING
+            )
+
+            # 标记完成
+            session.mark_creation_complete()
+            logger.info(f"会话 {session_id} 创建完成")
+
+        except Exception as e:
+            logger.error(f"会话 {session_id} 创建失败: {e}")
+            session.mark_creation_failed(str(e))
 
     async def get_session(self, session_id: str) -> PlaybackSession | None:
         """获取会话"""

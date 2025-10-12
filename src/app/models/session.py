@@ -17,6 +17,10 @@ from .window import TranscodeProfile, WindowCache
 class SessionStatus(str, Enum):
     """会话状态"""
 
+    CREATING = "creating"  # 正在创建
+    PREPROCESSING = "preprocessing"  # 音频预处理中
+    TRANSCODING = "transcoding"  # 转码中
+    INITIALIZING = "initializing"  # 初始化中
     ACTIVE = "active"  # 活跃状态
     IDLE = "idle"  # 空闲状态
     EXPIRED = "expired"  # 已过期
@@ -273,12 +277,21 @@ class PlaybackSession(BaseModel):
     profile_hash: str = Field(default="", description="配置哈希")
 
     # 会话状态
-    status: SessionStatus = Field(default=SessionStatus.ACTIVE, description="会话状态")
+    status: SessionStatus = Field(
+        default=SessionStatus.CREATING, description="会话状态"
+    )
     created_at: float = Field(default_factory=time.time, description="创建时间")
     last_access: float = Field(default_factory=time.time, description="最后访问时间")
     expires_at: float = Field(
         default_factory=lambda: time.time() + 3600, description="过期时间（默认1小时）"
     )
+
+    # 创建进度信息
+    progress_percent: float = Field(
+        default=0.0, ge=0, le=100, description="创建进度百分比"
+    )
+    progress_stage: str = Field(default="初始化", description="当前进度阶段描述")
+    error_message: str | None = Field(default=None, description="错误信息")
 
     # 播放状态
     current_time: float = Field(default=0.0, ge=0, description="当前播放时间")
@@ -423,6 +436,35 @@ class PlaybackSession(BaseModel):
     def get_audio_track_identifier(self) -> str | None:
         """获取音频轨道标识符"""
         return self.audio_track_id if self.hybrid_mode else None
+
+    def update_progress(
+        self, percent: float, stage: str, status: SessionStatus | None = None
+    ) -> None:
+        """
+        更新创建进度
+
+        Args:
+            percent: 进度百分比 (0-100)
+            stage: 当前阶段描述
+            status: 可选的会话状态更新
+        """
+        self.progress_percent = min(100.0, max(0.0, percent))
+        self.progress_stage = stage
+        if status is not None:
+            self.status = status
+        self.update_access()
+
+    def mark_creation_complete(self) -> None:
+        """标记创建完成"""
+        self.progress_percent = 100.0
+        self.progress_stage = "就绪"
+        self.status = SessionStatus.ACTIVE
+
+    def mark_creation_failed(self, error: str) -> None:
+        """标记创建失败"""
+        self.status = SessionStatus.ERROR
+        self.error_message = error
+        self.progress_stage = f"失败: {error}"
 
 
 class SessionStats(BaseModel):

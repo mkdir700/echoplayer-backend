@@ -15,7 +15,9 @@ class SessionCreateRequest(BaseModel):
 
     # 新的配置方式
     quality: str = Field(default="720p", description="质量档位 (480p, 720p, 1080p)")
-    enable_hybrid: bool | None = Field(None, description="是否启用混合模式（None=自动检测）")
+    enable_hybrid: bool | None = Field(
+        None, description="是否启用混合模式（None=自动检测）"
+    )
     video_only: bool = Field(default=False, description="是否只转码视频")
 
     # 兼容旧的转码配置（已废弃，但为了向后兼容保留）
@@ -122,3 +124,18 @@ class SessionPlaylistResponse(BaseModel):
     windows_count: int = Field(..., description="窗口数量")
     total_duration: float = Field(..., description="总时长")
     last_updated: float = Field(..., description="最后更新时间")
+
+
+class SessionProgressResponse(BaseModel):
+    """会话创建进度响应"""
+
+    session_id: str = Field(..., description="会话ID")
+    status: SessionStatus = Field(..., description="会话状态")
+    progress_percent: float = Field(..., ge=0, le=100, description="进度百分比")
+    progress_stage: str = Field(..., description="当前阶段描述")
+    error_message: str | None = Field(None, description="错误信息（如果有）")
+    is_ready: bool = Field(..., description="是否已准备好播放")
+    playlist_url: str | None = Field(None, description="播放列表URL（就绪后可用）")
+
+    # 音频转码进度（混合模式下可用）
+    audio_progress: dict | None = Field(None, description="音频转码进度信息")

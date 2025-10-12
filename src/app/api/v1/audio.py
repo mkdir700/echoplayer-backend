@@ -126,6 +126,38 @@ async def get_audio_file(
         raise HTTPException(status_code=500, detail="获取音频文件失败")
 
 
+@router.get("/{asset_hash}/{profile_hash}/progress")
+async def get_audio_progress(
+    asset_hash: str,
+    profile_hash: str,
+    audio_preprocessor: AudioPreprocessor = Depends(get_audio_preprocessor),
+):
+    """
+    获取音频轨道转码进度
+
+    Args:
+        asset_hash: 资产哈希
+        profile_hash: 配置哈希
+        audio_preprocessor: 音频预处理器
+
+    Returns:
+        dict: 转码进度信息
+    """
+    try:
+        progress = await audio_preprocessor.get_track_progress(asset_hash, profile_hash)
+
+        if progress is None:
+            raise HTTPException(status_code=404, detail="音频轨道不存在")
+
+        return progress
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取音频进度失败: {e}")
+        raise HTTPException(status_code=500, detail="获取进度失败")
+
+
 @router.get("/{asset_hash}/{profile_hash}/stats")
 async def get_audio_track_stats(
     asset_hash: str,
