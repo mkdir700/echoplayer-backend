@@ -90,6 +90,11 @@ class AppSettings(BaseSettings):
         default=48, gt=0, description="音频轨道TTL（小时）"
     )
 
+    # 预加载配置
+    preload_previous_windows: int = Field(
+        default=1, ge=0, description="预加载前N个窗口数量"
+    )
+
     @field_validator("sessions_root", "hls_segment_cache_root", "audio_cache_root")
     @classmethod
     def validate_paths(cls, v: str) -> str:

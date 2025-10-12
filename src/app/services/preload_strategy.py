@@ -6,6 +6,7 @@
 import asyncio
 import logging
 import time
+from pathlib import Path
 
 from app.models.window import TranscodeProfile
 from app.utils.hash import (
@@ -137,7 +138,6 @@ class PreloadStrategy:
 
         # 分析时间间隔
         avg_time_diff = sum(time_diffs) / len(time_diffs)
-        avg_timestamp_diff = sum(timestamp_diffs) / len(timestamp_diffs)
 
         # 连续播放判断：时间差与时间戳差近似
         if (
@@ -309,7 +309,7 @@ class PreloadStrategy:
         file_path: str,
         time_seconds: float,
         profile: TranscodeProfile,
-        priority: int,
+        _priority: int,  # noqa: ARG002
         task_key: str,
     ) -> None:
         """
@@ -319,7 +319,7 @@ class PreloadStrategy:
             file_path: 文件路径
             time_seconds: 目标时间点
             profile: 转码配置
-            priority: 优先级
+            _priority: 优先级（保留参数，未使用）
             task_key: 任务键
         """
         async with self.preload_semaphore:
@@ -369,7 +369,6 @@ class PreloadStrategy:
 
             while current_time < end_time:
                 window_id = calculate_window_id(current_time, profile.window_duration)
-                task_key = f"{file_path}:{window_id}"
 
                 # 检查是否已缓存
                 try:
@@ -449,3 +448,96 @@ class PreloadStrategy:
         self.preload_patterns.clear()
 
         logger.info("预取服务已关闭")
+
+    async def preload_previous_windows(
+        self,
+        file_path: str | Path,
+        current_window_id: int,
+        profile: TranscodeProfile,
+        count: int = 1,
+    ) -> tuple[int, int]:
+        """
+        预加载当前窗口之前的 N 个窗口
+
+        Args:
+            file_path: 输入文件路径
+            current_window_id: 当前窗口ID
+            profile: 转码配置
+            count: 预加载窗口数量（默认1）
+
+        Returns:
+            tuple[int, int]: (已排队窗口数, 已缓存窗口数)
+        """
+        if count <= 0:
+            return 0, 0
+
+        file_path = Path(file_path) if isinstance(file_path, str) else file_path
+        queued_windows = 0
+        cached_windows = 0
+
+        # 计算需要预加载的窗口ID列表：[current_window_id - count, ..., current_window_id - 1]
+        preload_window_ids = [
+            current_window_id - i
+            for i in range(count, 0, -1)
+            if current_window_id - i >= 0
+        ]
+
+        if not preload_window_ids:
+            logger.debug(f"窗口 {current_window_id} 之前没有可预加载的窗口")
+            return 0, 0
+
+        logger.info(
+            f"开始预加载窗口 {current_window_id} 之前的 {len(preload_window_ids)} 个窗口: {preload_window_ids}"
+        )
+
+        # 计算哈希值（复用以提高性能）
+        try:
+            asset_hash = calculate_asset_hash(file_path)
+            profile_hash = calculate_profile_hash(profile.__dict__, profile.version)
+        except Exception as e:
+            logger.error(f"计算哈希失败: {e}")
+            return 0, 0
+
+        # 确保缓存索引已加载
+        await self.jit_transcoder._ensure_cache_loaded()
+
+        # 检查每个窗口并加入预加载队列
+        for window_id in preload_window_ids:
+            cache_key = (asset_hash, profile_hash, window_id)
+            task_key = f"{file_path}:{window_id}"
+
+            # 检查是否已在队列中
+            if task_key in self.preload_tasks:
+                existing_task = self.preload_tasks[task_key]
+                if not existing_task.done():
+                    logger.debug(f"窗口 {window_id} 已在预取队列中，跳过")
+                    continue
+
+            # 检查是否已缓存
+            try:
+                if await self.jit_transcoder._check_cache_hit(cache_key):
+                    logger.debug(f"窗口 {window_id} 已缓存，跳过预加载")
+                    cached_windows += 1
+                    continue
+            except Exception as e:
+                logger.warning(f"检查窗口 {window_id} 缓存状态失败: {e}")
+                continue
+
+            # 加入预加载队列（低优先级）
+            try:
+                window_start_time = window_id * profile.window_duration
+                await self._queue_preload_task(
+                    str(file_path),
+                    window_start_time,
+                    profile,
+                    priority=3,  # 低优先级，确保不影响用户主动请求
+                )
+                queued_windows += 1
+                logger.debug(f"窗口 {window_id} 已加入预加载队列")
+            except Exception as e:
+                logger.error(f"加入窗口 {window_id} 到预加载队列失败: {e}")
+
+        logger.info(
+            f"预加载完成: 已排队 {queued_windows} 个窗口, 已缓存 {cached_windows} 个窗口"
+        )
+        return queued_windows, cached_windows

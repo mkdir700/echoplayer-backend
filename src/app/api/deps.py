@@ -4,6 +4,7 @@ from app.config.manager import ConfigManager
 from app.services.audio_preprocessor import AudioPreprocessor
 from app.services.cache_manager import CacheManager
 from app.services.jit_transcoder import JITTranscoder
+from app.services.preload_strategy import PreloadStrategy
 from app.services.session_manager import SessionManager
 
 
@@ -13,6 +14,15 @@ async def get_cache_manager():
 
 async def get_jit_transcoder():
     return JITTranscoder()
+
+
+async def get_preload_strategy(
+    jit_transcoder: JITTranscoder = Depends(get_jit_transcoder),
+):
+    """获取预加载策略实例"""
+    config = ConfigManager()
+    max_preload_tasks = getattr(config.app_settings, "max_preload_tasks", 2)
+    return PreloadStrategy(jit_transcoder, max_preload_tasks)
 
 
 async def get_session_manager(
