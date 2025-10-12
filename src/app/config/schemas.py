@@ -207,5 +207,10 @@ class TranscodeConfig(BaseModel):
     window_duration: float = Field(default=12.0, gt=0, description="窗口时长（秒）")
     window_segments: int = Field(default=3, ge=1, description="每窗口分片数")
 
+    # 预加载配置
+    preload_previous_windows: int = Field(
+        default=1, ge=0, description="预加载前N个窗口数量"
+    )
+
     class Config:
         extra = "forbid"

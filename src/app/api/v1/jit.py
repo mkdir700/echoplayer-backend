@@ -2,6 +2,7 @@
 v1 JIT 转码 API 路由
 """
 
+import asyncio
 import logging
 import pathlib
 import time
@@ -12,9 +13,12 @@ from fastapi.responses import FileResponse
 from app.api.deps import (
     CacheManager,
     JITTranscoder,
+    PreloadStrategy,
     get_cache_manager,
     get_jit_transcoder,
+    get_preload_strategy,
 )
+from app.config import ConfigManager
 from app.models.window import TranscodeProfile
 from app.schemas.jit_request import (
     CacheCleanupRequest,
@@ -110,17 +114,22 @@ async def serve_hls_file(
     window_id: str,
     file_name: str,
     jit_transcoder: JITTranscoder = Depends(get_jit_transcoder),
+    preload_strategy: PreloadStrategy = Depends(get_preload_strategy),
 ):
     """
     提供 HLS 文件服务
 
     - 支持 m3u8 播放列表和 ts 分片文件
     - 直接从缓存目录读取文件
+    - 自动触发前 N 个窗口的后台预加载
     """
     # 获取文件路径
     file_path = jit_transcoder.get_window_url(
         asset_hash, profile_hash, int(window_id), file_name
     )
+
+    input_file = None
+    profile = None
 
     if not file_path or not file_path.exists():
         # 文件不存在，尝试立即转码
@@ -161,8 +170,7 @@ async def serve_hls_file(
 
             # 立即启动转码并等待完成
             logger.info(
-                f"开始为 {asset_hash}/{profile_hash}/{window_id}/"
-                f"{file_name} 同步转码"
+                f"开始为 {asset_hash}/{profile_hash}/{window_id}/{file_name} 同步转码"
             )
             playlist_url = await jit_transcoder.ensure_window(
                 input_file, correct_start_time, profile
@@ -187,6 +195,36 @@ async def serve_hls_file(
             raise HTTPException(
                 status_code=500,
                 detail=f"Transcoding failed: {str(e)}",
+            )
+
+    # 触发后台预加载（非阻塞）
+    # 如果还没有获取 input_file 和 profile，从缓存中获取
+    if input_file is None or profile is None:
+        try:
+            (
+                input_file,
+                _,
+                _,
+                profile,
+            ) = await jit_transcoder.get_transcoding_info(
+                asset_hash, profile_hash, int(window_id)
+            )
+        except Exception as e:
+            logger.warning(f"获取转码信息用于预加载失败: {e}")
+
+    # 如果成功获取了转码信息，触发预加载
+    if input_file and profile:
+        config = ConfigManager()
+        preload_count = config.app_settings.preload_previous_windows
+        if preload_count > 0:
+            # 创建后台任务，不等待完成
+            asyncio.create_task(
+                preload_strategy.preload_previous_windows(
+                    input_file, int(window_id), profile, preload_count
+                )
+            )
+            logger.debug(
+                f"已触发窗口 {window_id} 前 {preload_count} 个窗口的后台预加载"
             )
 
     # 确定媒体类型
