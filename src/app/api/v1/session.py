@@ -18,6 +18,7 @@ from app.schemas.session_request import (
     SessionInfoResponse,
     SessionListResponse,
     SessionPlaylistResponse,
+    SessionProgressResponse,
     SessionSeekRequest,
     SessionSeekResponse,
     SessionStatsResponse,
@@ -37,11 +38,13 @@ async def create_session(
     session_manager: SessionManager = Depends(get_session_manager),
 ):
     """
-    创建新的播放会话
+    创建新的播放会话（异步创建，立即返回）
 
+    - 立即返回 session_id
+    - 后台异步处理转码工作
+    - 使用 /progress 接口查询创建进度
     - 支持跨窗口连续播放
     - 自动预加载相邻窗口
-    - 返回统一的播放列表URL
     """
     try:
         # 检查文件是否存在
@@ -51,7 +54,7 @@ async def create_session(
                 status_code=404, detail=f"文件不存在: {request.file_path}"
             )
 
-        # 创建会话（使用新的接口）
+        # 创建会话（立即返回，后台处理）
         session = await session_manager.create_session(
             file_path=file_path,
             quality=request.quality,
@@ -67,8 +70,8 @@ async def create_session(
             success=True,
             session_id=session.session_id,
             playlist_url=playlist_url,
-            asset_hash=session.asset_hash,
-            profile_hash=session.profile_hash,
+            asset_hash=session.asset_hash if session.asset_hash else "",
+            profile_hash=session.profile_hash if session.profile_hash else "",
             initial_windows_loaded=len(session.loaded_windows),
         )
 
@@ -93,9 +96,22 @@ async def get_session_playlist(
     - 混合模式下返回主播放列表(Master Playlist)
     """
     try:
+        session = await session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        from app.models.session import SessionStatus
+
+        # 检查会话是否已准备好
+        if session.status != SessionStatus.ACTIVE:
+            raise HTTPException(
+                status_code=425,  # Too Early
+                detail=f"会话正在创建中，请稍后重试。当前进度: {session.progress_percent:.1f}%",
+            )
+
         playlist_content = await session_manager.get_session_playlist(session_id)
         if not playlist_content:
-            raise HTTPException(status_code=404, detail="会话不存在或播放列表无效")
+            raise HTTPException(status_code=404, detail="播放列表无效")
 
         return Response(
             content=playlist_content,
@@ -153,6 +169,73 @@ async def get_session_video_playlist(
     except Exception as e:
         logger.error(f"获取视频播放列表失败: {e}")
         raise HTTPException(status_code=500, detail=f"视频播放列表错误: {str(e)}")
+
+
+@router.get("/{session_id}/progress", response_model=SessionProgressResponse)
+async def get_session_progress(
+    session_id: str,
+    session_manager: SessionManager = Depends(get_session_manager),
+):
+    """
+    获取会话创建进度
+
+    - 实时返回创建进度百分比
+    - 显示当前处理阶段
+    - 包含音频转码进度（混合模式）
+    - 用于前端展示加载动画
+    """
+    try:
+        session = await session_manager.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
+
+        from app.models.session import SessionStatus
+
+        # 判断是否已准备好播放
+        is_ready = session.status == SessionStatus.ACTIVE
+
+        # 获取音频转码进度（如果启用混合模式）
+        audio_progress = None
+        if session.hybrid_mode and session.audio_track_id:
+            try:
+                # 从 audio_track_id 解析出哈希值
+                # audio_track_{asset_hash}_{profile_hash}
+                parts = session.audio_track_id.split("_")
+                if len(parts) == 4:
+                    asset_hash = parts[2]
+                    profile_hash = parts[3]
+
+                    # 导入依赖
+                    from app.api.deps import get_audio_preprocessor
+
+                    audio_preprocessor = await get_audio_preprocessor()
+                    progress = await audio_preprocessor.get_track_progress(
+                        asset_hash, profile_hash
+                    )
+
+                    if progress:
+                        audio_progress = progress
+            except Exception as e:
+                logger.warning(f"获取音频转码进度失败: {e}")
+
+        return SessionProgressResponse(
+            session_id=session.session_id,
+            status=session.status,
+            progress_percent=session.progress_percent,
+            progress_stage=session.progress_stage,
+            error_message=session.error_message,
+            is_ready=is_ready,
+            playlist_url=f"/api/v1/session/{session_id}/playlist.m3u8"
+            if is_ready
+            else None,
+            audio_progress=audio_progress,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取会话进度失败: {e}")
+        raise HTTPException(status_code=500, detail=f"进度查询错误: {str(e)}")
 
 
 @router.get("/{session_id}/info", response_model=SessionInfoResponse)

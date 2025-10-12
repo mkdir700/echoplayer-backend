@@ -194,6 +194,22 @@
           <p id="currentSession" class="text-sm mb-3 p-2 bg-gray-50 rounded">
             当前会话: 未创建
           </p>
+          <div id="sessionProgressContainer" class="mb-3 space-y-2">
+            <div class="flex justify-between text-xs text-slate-600">
+              <span>会话进度</span>
+              <span id="sessionProgressLabel">未开始</span>
+            </div>
+            <div class="h-2 w-full bg-slate-200 rounded">
+              <div
+                id="sessionProgressBar"
+                class="h-2 bg-blue-600 rounded transition-all duration-300 ease-out"
+                style="width: 0%"
+              ></div>
+            </div>
+            <p id="sessionProgressStage" class="text-xs text-slate-600">
+              等待会话创建
+            </p>
+          </div>
 
           <div class="space-y-3">
             <!-- 会话信息按钮组 -->
@@ -383,6 +399,9 @@
       const reportButton = document.getElementById("reportButton");
       const deleteButton = document.getElementById("deleteSession");
       const currentSessionLabel = document.getElementById("currentSession");
+      const sessionProgressBar = document.getElementById("sessionProgressBar");
+      const sessionProgressLabel = document.getElementById("sessionProgressLabel");
+      const sessionProgressStage = document.getElementById("sessionProgressStage");
       const videoElement = document.getElementById("video");
       const playerStatus = document.getElementById("playerStatus");
       const logContainer = document.getElementById("log");
@@ -394,6 +413,8 @@
       let currentSessionId = null;
       let currentPlaylistUrl = null;
       let hlsPlayer = null;
+      let progressPollTimer = null;
+      let lastProgressSnapshot = null;
 
       // localStorage keys for persistent storage
       const STORAGE_KEYS = {
@@ -537,6 +558,130 @@
         return response.text();
       }
 
+      function resetSessionProgressUI() {
+        if (!sessionProgressBar || !sessionProgressLabel || !sessionProgressStage) {
+          return;
+        }
+        sessionProgressBar.style.width = "0%";
+        sessionProgressBar.classList.remove("bg-green-500", "bg-red-500");
+        sessionProgressBar.classList.add("bg-blue-600");
+        sessionProgressLabel.textContent = "未开始";
+        sessionProgressStage.textContent = "等待会话创建";
+        lastProgressSnapshot = null;
+      }
+
+      function updateSessionProgressUI(progress) {
+        if (!sessionProgressBar || !sessionProgressLabel || !sessionProgressStage) {
+          return;
+        }
+        const percentValue = Number(progress?.progress_percent ?? 0);
+        const percent = Math.max(0, Math.min(percentValue, 100));
+        sessionProgressBar.style.width = `${percent}%`;
+        sessionProgressLabel.textContent = `${percent.toFixed(1)}%`;
+
+        const stageText = progress?.error_message
+          ? `错误: ${progress.error_message}`
+          : progress?.progress_stage || "处理中";
+        sessionProgressStage.textContent = stageText;
+
+        sessionProgressBar.classList.remove("bg-blue-600", "bg-green-500", "bg-red-500");
+        if (progress?.error_message) {
+          sessionProgressBar.classList.add("bg-red-500");
+        } else if (progress?.is_ready) {
+          sessionProgressBar.classList.add("bg-green-500");
+        } else {
+          sessionProgressBar.classList.add("bg-blue-600");
+        }
+      }
+
+      function maybeLogProgress(progress) {
+        if (!progress) return;
+        const percent = Number(progress.progress_percent ?? 0);
+        const stage = progress.progress_stage || "";
+        const isReady = Boolean(progress.is_ready);
+        const errorMessage = progress.error_message || null;
+
+        const lastPercent = lastProgressSnapshot?.percent ?? -1;
+        const lastStage = lastProgressSnapshot?.stage;
+        const lastReady = Boolean(lastProgressSnapshot?.isReady);
+        const lastError = lastProgressSnapshot?.errorMessage;
+
+        const percentChanged = Math.abs(percent - lastPercent) >= 5;
+        const stageChanged = stage !== lastStage;
+        const readyChanged = isReady && !lastReady;
+        const errorChanged = Boolean(errorMessage) && errorMessage !== lastError;
+
+        if (stageChanged || percentChanged || readyChanged || errorChanged) {
+          log(
+            "会话进度更新",
+            {
+              stage,
+              percent: percent.toFixed(1),
+              status: progress.status,
+              is_ready: progress.is_ready,
+              error: errorMessage || undefined,
+            },
+            Boolean(errorMessage)
+          );
+        }
+
+        lastProgressSnapshot = {
+          stage,
+          percent,
+          isReady,
+          errorMessage,
+        };
+      }
+
+      function stopProgressPolling() {
+        if (progressPollTimer) {
+          clearInterval(progressPollTimer);
+          progressPollTimer = null;
+        }
+      }
+
+      async function pollSessionProgress(sessionId) {
+        if (!sessionId) return;
+        try {
+          const progress = await jsonRequest(
+            "GET",
+            `/session/${sessionId}/progress`
+          );
+          updateSessionProgressUI(progress);
+          maybeLogProgress(progress);
+
+          if (progress?.playlist_url) {
+            currentPlaylistUrl = progress.playlist_url;
+          }
+
+          if (progress?.error_message) {
+            playerStatus.textContent = `会话创建失败: ${progress.error_message}`;
+            stopProgressPolling();
+            return;
+          }
+
+          if (progress?.is_ready) {
+            stopProgressPolling();
+            setSessionState(progress.session_id, progress.playlist_url || currentPlaylistUrl);
+            if (progress.playlist_url || currentPlaylistUrl) {
+              playerStatus.textContent = "会话准备就绪，加载播放列表...";
+              loadPlaylist(progress.playlist_url || currentPlaylistUrl);
+            }
+          }
+        } catch (error) {
+          sessionProgressStage.textContent = `获取进度失败: ${error.message}`;
+        }
+      }
+
+      function startProgressPolling(sessionId) {
+        stopProgressPolling();
+        if (!sessionId) return;
+        pollSessionProgress(sessionId);
+        progressPollTimer = setInterval(() => {
+          pollSessionProgress(sessionId);
+        }, 2000);
+      }
+
       function setSessionState(sessionId, playlistUrl) {
         currentSessionId = sessionId;
         currentPlaylistUrl = playlistUrl;
@@ -549,6 +694,11 @@
         seekButton.disabled = !hasSession;
         reportButton.disabled = !hasSession;
         deleteButton.disabled = !hasSession;
+        if (!hasSession) {
+          stopProgressPolling();
+          resetSessionProgressUI();
+          playerStatus.textContent = "播放器尚未加载播放列表";
+        }
       }
 
       function loadPlaylist(url) {
@@ -603,6 +753,11 @@
           payload.window_duration = parseFloat(windowDurationInput.value);
         try {
           createButton.disabled = true;
+          stopProgressPolling();
+          resetSessionProgressUI();
+          sessionProgressLabel.textContent = "0.0%";
+          sessionProgressStage.textContent = "正在创建会话...";
+          playerStatus.textContent = "会话创建中，请稍候...";
           const response = await jsonRequest(
             "POST",
             "/session/create",
@@ -610,10 +765,15 @@
           );
           log("创建会话", response);
           setSessionState(response.session_id, response.playlist_url);
-          loadPlaylist(response.playlist_url);
+          sessionProgressStage.textContent = "等待进度更新...";
+          startProgressPolling(response.session_id);
+          playerStatus.textContent = "正在等待会话转码完成...";
         } catch (error) {
           log("创建会话失败", error.message, true);
           alert(`创建会话失败: ${error.message}`);
+          sessionProgressStage.textContent = `创建会话失败: ${error.message}`;
+          sessionProgressLabel.textContent = "未开始";
+          playerStatus.textContent = "播放器尚未加载播放列表";
         } finally {
           createButton.disabled = false;
         }

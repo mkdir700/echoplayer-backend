@@ -113,6 +113,16 @@ class AudioTrack(BaseModel):
     completed_at: float | None = Field(default=None, description="完成时间")
     error_message: str | None = Field(default=None, description="错误信息")
 
+    # 进度信息（基于 FFmpeg 实时输出）
+    progress_percent: float = Field(
+        default=0.0, ge=0, le=100, description="转码进度百分比"
+    )
+    processed_time: float = Field(default=0.0, ge=0, description="已转码时长（秒）")
+    transcode_speed: float = Field(
+        default=0.0, ge=0, description="转码速度倍率（如 1.5x）"
+    )
+    eta_seconds: float | None = Field(default=None, description="预计剩余时间（秒）")
+
     # 文件信息
     total_size: int = Field(default=0, ge=0, description="总文件大小（字节）")
 
@@ -171,6 +181,36 @@ class AudioTrack(BaseModel):
         self.completed_at = time.time()
         self.error_message = error
 
+    def update_progress(
+        self, processed_time: float, transcode_speed: float | None = None
+    ) -> None:
+        """
+        更新转码进度
+
+        Args:
+            processed_time: 已转码的时长（秒）
+            transcode_speed: 转码速度倍率（如 1.5x）
+        """
+        self.processed_time = processed_time
+
+        # 计算进度百分比
+        if self.duration > 0:
+            self.progress_percent = min(100.0, (processed_time / self.duration) * 100.0)
+        else:
+            self.progress_percent = 0.0
+
+        # 更新转码速度
+        if transcode_speed is not None and transcode_speed > 0:
+            self.transcode_speed = transcode_speed
+
+            # 计算预计剩余时间
+            remaining_time = self.duration - processed_time
+            if remaining_time > 0:
+                self.eta_seconds = remaining_time / transcode_speed
+            else:
+                self.eta_seconds = 0.0
+        else:
+            self.eta_seconds = None
 
     def cleanup(self) -> None:
         """清理音频轨道文件"""

@@ -7,13 +7,13 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 
 import aiofiles
 
 from app.config import ConfigManager
 from app.models.audio_track import (
-    AudioSegment,
     AudioTrack,
     AudioTrackCache,
     AudioTrackProfile,
@@ -22,6 +22,79 @@ from app.models.audio_track import (
 from app.utils.hash import calculate_asset_hash, calculate_profile_hash
 
 logger = logging.getLogger(__name__)
+
+
+def parse_ffmpeg_progress(line: str) -> dict | None:
+    """
+    解析 FFmpeg -progress 输出的进度信息
+
+    使用 -progress pipe:2 后，FFmpeg 输出结构化的键值对格式：
+    out_time_us=60436500
+    out_time=00:01:00.436500
+    speed= 120x
+    progress=continue
+
+    Args:
+        line: FFmpeg stderr 输出的一行（键值对格式）
+
+    Returns:
+        dict: 包含进度信息的字典，如果无法解析则返回 None
+            - time: 已转码时长（秒）
+            - speed: 转码速度倍率
+            - bitrate: 码率（kbits/s，可选）
+            - size: 当前输出大小（字节，可选）
+    """
+    line = line.strip()
+
+    # 解析 out_time=HH:MM:SS.ms 格式
+    if line.startswith("out_time="):
+        time_str = line.split("=", 1)[1]
+        # 解析 HH:MM:SS.ms 格式
+        parts = time_str.split(":")
+        if len(parts) == 3:
+            try:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = float(parts[2])
+                total_seconds = hours * 3600 + minutes * 60 + seconds
+                return {"time": total_seconds}
+            except (ValueError, IndexError):
+                pass
+
+    # 解析 speed=X.XXx 或 speed= XXXx 格式
+    elif line.startswith("speed="):
+        speed_str = line.split("=", 1)[1].strip()
+        # 移除 'x' 后缀
+        if speed_str.endswith("x"):
+            speed_str = speed_str[:-1].strip()
+            try:
+                speed = float(speed_str)
+                return {"speed": speed}
+            except ValueError:
+                pass
+
+    # 解析 bitrate=XXX.Xkbits/s 格式（可选）
+    elif line.startswith("bitrate="):
+        bitrate_str = line.split("=", 1)[1].strip()
+        # 移除 'kbits/s' 后缀
+        if "kbits/s" in bitrate_str:
+            bitrate_str = bitrate_str.replace("kbits/s", "").strip()
+            try:
+                bitrate = float(bitrate_str)
+                return {"bitrate": bitrate}
+            except ValueError:
+                pass
+
+    # 解析 total_size=XXXXX 格式（字节）
+    elif line.startswith("total_size="):
+        size_str = line.split("=", 1)[1].strip()
+        try:
+            size = int(size_str)
+            return {"size": size}
+        except ValueError:
+            pass
+
+    return None
 
 
 class AudioPreprocessor:
@@ -66,6 +139,7 @@ class AudioPreprocessor:
         self,
         input_file: str | Path,
         profile: AudioTrackProfile,
+        progress_callback=None,
     ) -> str:
         """
         确保音频轨道可用
@@ -73,6 +147,7 @@ class AudioPreprocessor:
         Args:
             input_file: 输入文件路径
             profile: 音频转码配置
+            progress_callback: 进度回调函数 (percent: float, stage: str) -> None
 
         Returns:
             str: 音频轨道标识符
@@ -106,7 +181,11 @@ class AudioPreprocessor:
 
         # 启动新的音频处理任务
         return await self._start_audio_processing(
-            input_path, asset_hash, profile_hash, profile
+            input_path,
+            asset_hash,
+            profile_hash,
+            profile,
+            progress_callback,
         )
 
     async def _check_cache_hit(self, cache_key: tuple[str, str]) -> bool:
@@ -133,6 +212,7 @@ class AudioPreprocessor:
         asset_hash: str,
         profile_hash: str,
         profile: AudioTrackProfile,
+        progress_callback=None,
     ) -> str:
         """启动音频处理任务"""
         # 获取视频信息以确定时长
@@ -161,7 +241,7 @@ class AudioPreprocessor:
 
         try:
             # 执行音频处理
-            await self._process_audio_track(track)
+            await self._process_audio_track(track, progress_callback)
 
             if track.is_completed:
                 # 添加到缓存索引
@@ -183,14 +263,16 @@ class AudioPreprocessor:
             if cache_key in self.running_tracks:
                 del self.running_tracks[cache_key]
 
-    async def _process_audio_track(self, track: AudioTrack) -> None:
+    async def _process_audio_track(
+        self, track: AudioTrack, progress_callback=None
+    ) -> None:
         """处理音频轨道（仅转码，不分片）"""
         async with self.task_semaphore:  # 控制并发数
             try:
                 track.start_processing()
 
                 # 第一步：提取完整音频轨道
-                await self._extract_audio_track(track)
+                await self._extract_audio_track(track, progress_callback)
 
                 # 第二步：保存元数据
                 await self._save_track_metadata(track)
@@ -205,8 +287,10 @@ class AudioPreprocessor:
                 logger.error(f"音频轨道处理失败: {e}")
                 raise
 
-    async def _extract_audio_track(self, track: AudioTrack) -> None:
-        """提取完整音频轨道"""
+    async def _extract_audio_track(
+        self, track: AudioTrack, progress_callback=None
+    ) -> None:
+        """提取完整音频轨道（带实时进度监控）"""
         profile = track.profile
         input_file = str(track.input_file)
         output_file = str(track.track_file_path)
@@ -231,6 +315,8 @@ class AudioPreprocessor:
             profile.bitrate,  # 音频码率
             "-avoid_negative_ts",
             "disabled",  # 保持原始时间戳
+            "-progress",
+            "pipe:2",  # 输出进度信息到 stderr
             output_file,  # 输出文件
         ]
 
@@ -244,29 +330,92 @@ class AudioPreprocessor:
                 stderr=asyncio.subprocess.PIPE,
             )
 
-            # 等待进程完成
-            stdout, stderr = await process.communicate()
+            # 实时读取 stderr 并解析进度
+            stderr_lines = []
+            last_progress_log = 0.0
 
-            if process.returncode == 0:
+            # 用于累积进度信息（因为每行只包含一个字段）
+            current_progress = {"time": 0.0, "speed": 0.0}
+
+            if process.stderr:
+                async for line_bytes in process.stderr:
+                    try:
+                        line = line_bytes.decode("utf-8", errors="ignore").strip()
+                        stderr_lines.append(line)
+
+                        # 解析进度信息（键值对格式）
+                        progress = parse_ffmpeg_progress(line)
+                        if progress:
+                            # 更新累积的进度信息
+                            if "time" in progress:
+                                current_progress["time"] = progress["time"]
+                            if "speed" in progress:
+                                current_progress["speed"] = progress["speed"]
+                            if "bitrate" in progress:
+                                current_progress["bitrate"] = progress["bitrate"]
+                            if "size" in progress:
+                                current_progress["size"] = progress["size"]
+
+                            # 当有时间信息时，更新 track 进度
+                            if current_progress["time"] > 0:
+                                processed_time = current_progress["time"]
+                                transcode_speed = current_progress.get("speed")
+
+                                # 更新进度
+                                track.update_progress(processed_time, transcode_speed)
+
+                                # 调用进度回调（如果提供）
+                                if progress_callback:
+                                    # 音频预处理进度范围：5% ~ 85%（占80%份额）
+                                    percent = (
+                                        5.0 + (track.progress_percent / 100.0) * 80.0
+                                    )
+                                    await progress_callback(percent, "正在预处理音频")
+
+                                # 定期打印日志（避免日志过多）
+                                if processed_time - last_progress_log >= 5.0:
+                                    eta_info = (
+                                        f", 预计剩余: {track.eta_seconds:.0f}s"
+                                        if track.eta_seconds
+                                        else ""
+                                    )
+                                    logger.info(
+                                        f"音频转码进度: {track.progress_percent:.1f}% "
+                                        f"({track.processed_time:.1f}s/{track.duration:.1f}s), "
+                                        f"速度: {track.transcode_speed:.2f}x{eta_info}"
+                                    )
+                                    last_progress_log = processed_time
+
+                    except Exception as e:
+                        logger.warning(f"解析 FFmpeg 输出失败: {e}")
+
+            # 等待进程结束
+            returncode = await process.wait()
+
+            if returncode == 0:
+                # 确保进度为 100%
+                track.update_progress(track.duration, track.transcode_speed)
+
                 # 验证输出文件
                 if track.track_file_path.exists():
                     track.total_size = track.track_file_path.stat().st_size
-                    logger.info(f"音频轨道提取成功: {track.total_size} 字节")
+                    logger.info(
+                        f"音频轨道提取成功: {track.total_size} 字节, "
+                        f"平均速度: {track.transcode_speed:.2f}x"
+                    )
                 else:
                     raise RuntimeError("音频轨道文件未生成")
             else:
                 error_msg = (
-                    stderr.decode()
-                    if stderr
-                    else f"FFmpeg 返回代码: {process.returncode}"
+                    "\n".join(stderr_lines[-10:])
+                    if stderr_lines
+                    else f"FFmpeg 返回代码: {returncode}"
                 )
                 raise RuntimeError(f"音频提取失败: {error_msg}")
 
         except Exception as e:
             logger.error(f"音频轨道提取失败: {e}")
             raise
-
-
 
     async def _get_video_info(self, input_file: Path) -> dict:
         """获取视频信息，特别是时长"""
@@ -374,8 +523,67 @@ class AudioPreprocessor:
                 return cache
             except Exception as e:
                 logger.warning(f"读取音频轨道元数据失败 {meta_file}: {e}")
-        # TODO: 源数据不存在，需要 fallback 策略，比如去访问实际的目录，统计信息，然后写入 meta
-        raise FileNotFoundError("Audio 源数据不存在")
+
+        # Fallback: meta 文件不存在，从实际文件生成缓存信息
+        logger.info(f"元数据文件不存在，从实际文件重建缓存信息: {track_dir}")
+        track_file = track_dir / "audio_track.aac"
+
+        if not track_file.exists():
+            raise FileNotFoundError(f"音频轨道文件不存在: {track_file}")
+
+        # 获取视频信息以获取时长
+        # 从目录结构推断原始文件路径（这里需要从实际音频文件获取时长）
+        duration = 0.0
+        try:
+            # 使用 ffprobe 获取音频文件时长
+            cmd_args = [
+                self.config.app_settings.ffprobe_path,
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                str(track_file),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+
+            stdout, _ = await process.communicate()
+
+            if process.returncode == 0 and stdout:
+                info = json.loads(stdout.decode())
+                if info.get("format"):
+                    duration = float(info["format"].get("duration", 0))
+        except Exception as e:
+            logger.warning(f"无法获取音频文件时长 {track_file}: {e}")
+
+        # 获取文件大小
+        total_size = track_file.stat().st_size
+        created_at = track_file.stat().st_mtime
+
+        # 创建缓存对象
+        cache = AudioTrackCache(
+            asset_hash=asset_hash,
+            profile_hash=profile_hash,
+            track_dir=track_dir,
+            duration=duration,
+            total_size=total_size,
+            created_at=created_at,
+            last_access=time.time(),
+            hit_count=0,
+        )
+
+        # 保存元数据以便下次使用
+        await self._save_cache_metadata(cache)
+        logger.info(
+            f"重建元数据完成: {track_dir}, 时长={duration:.1f}s, 大小={total_size}"
+        )
+
+        return cache
 
     async def _save_cache_metadata(self, cache: AudioTrackCache) -> None:
         """保存缓存元数据"""
@@ -436,6 +644,48 @@ class AudioPreprocessor:
             logger.warning(f"计算目录大小失败 {directory}: {e}")
         return total_size
 
+    async def get_track_progress(
+        self, asset_hash: str, profile_hash: str
+    ) -> dict | None:
+        """
+        获取音频轨道转码进度
+
+        Args:
+            asset_hash: 资产哈希
+            profile_hash: 配置哈希
+
+        Returns:
+            dict: 进度信息，如果轨道不存在或已完成则返回 None
+        """
+        cache_key = (asset_hash, profile_hash)
+
+        # 检查是否正在处理
+        if cache_key in self.running_tracks:
+            track = self.running_tracks[cache_key]
+            return {
+                "status": track.status.value,
+                "progress_percent": track.progress_percent,
+                "processed_time": track.processed_time,
+                "total_duration": track.duration,
+                "transcode_speed": track.transcode_speed,
+                "eta_seconds": track.eta_seconds,
+                "error_message": track.error_message,
+            }
+
+        # 检查缓存
+        await self._ensure_cache_loaded()
+        if cache_key in self.track_cache:
+            return {
+                "status": "completed",
+                "progress_percent": 100.0,
+                "processed_time": self.track_cache[cache_key].duration,
+                "total_duration": self.track_cache[cache_key].duration,
+                "transcode_speed": 0.0,
+                "eta_seconds": 0.0,
+                "error_message": None,
+            }
+
+        return None
 
     async def get_track_stats(self) -> AudioTrackStats:
         """获取音频轨道统计信息"""
@@ -494,8 +744,6 @@ class AudioPreprocessor:
 
         return removed_count
 
-
-
     async def get_audio_playlist(
         self, asset_hash: str, profile_hash: str
     ) -> str | None:
@@ -540,12 +788,10 @@ class AudioPreprocessor:
                 "#EXT-X-MEDIA-SEQUENCE:0",
                 f"#EXTINF:{cache.duration:.6f},",
                 audio_file_url,
-                "#EXT-X-ENDLIST"
+                "#EXT-X-ENDLIST",
             ]
 
-            logger.debug(
-                f"生成音频播放列表: 单个文件，总时长{cache.duration:.1f}s"
-            )
+            logger.debug(f"生成音频播放列表: 单个文件，总时长{cache.duration:.1f}s")
             return "\n".join(lines)
 
         except Exception as e:

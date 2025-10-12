@@ -38,6 +38,7 @@ class SessionFactory:
         initial_time: float = 0.0,
         enable_hybrid: bool | None = None,
         video_only: bool = False,
+        progress_callback=None,
     ) -> PlaybackSession:
         """
         创建新的播放会话
@@ -48,6 +49,7 @@ class SessionFactory:
             initial_time: 初始播放时间
             enable_hybrid: 是否启用混合模式（None=自动检测）
             video_only: 是否只转码视频
+            progress_callback: 进度回调函数 (percent: float, stage: str) -> None
 
         Returns:
             PlaybackSession: 创建的会话
@@ -74,7 +76,9 @@ class SessionFactory:
                 # 创建音频配置用于预处理
                 audio_profile = self._create_audio_profile()
                 audio_track_id = await self.audio_preprocessor.ensure_audio_track(
-                    file_path, audio_profile
+                    file_path,
+                    audio_profile,
+                    progress_callback=progress_callback,
                 )
                 if not audio_track_id:
                     logger.warning("音频预处理失败，禁用混合模式")
